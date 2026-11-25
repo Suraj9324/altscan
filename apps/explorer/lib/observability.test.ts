@@ -1,0 +1,125 @@
+import { describe, it, expect, vi, afterEach } from 'vitest'
+import { DrizzleQueryError } from 'drizzle-orm'
+import { makeError } from 'ethers'
+import { swallow, swallowed, resetSwallowThrottle, arrayShape } from './observability'
+
+afterEach(() => {
+  vi.restoreAllMocks()
+  resetSwallowThrottle()
+})
+
+describe('swallow', () => {
+  it('logs the failure under a greppable [tag], which is how these are found in Render logs', () => {
+    const spy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    swallow('tx/logs', new Error('connection refused'))
+    expect(spy).toHaveBeenCalledTimes(1)
+    expect(spy.mock.calls[0][0]).toBe('[tx/logs]')
+    expect(String(spy.mock.calls[0][1])).toContain('connection refused')
+  })
+
+  // drizzle-orm >= 0.44 rethrows every driver error as a DrizzleQueryError whose
+  // message is the SQL and its params; the reason is only on its cause.
+  it('logs what the database said about a failed query, not the statement', () => {
+    const spy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    const cause = Object.assign(new Error('canceling statement due to statement timeout'), { code: '57014' })
+    swallow('tx/logs', new DrizzleQueryError('select "address" from "logs" where "tx_hash" = $1', ['0xabc'], cause))
+    const logged = String(spy.mock.calls[0][1])
+    expect(logged).toContain('statement timeout')
+    expect(logged).not.toContain('select "address"')
+  })
+
+  // ethers 6.17 puts the complete requestUrl, keyed endpoint and all, in the
+  // message of every HTTP failure, and the explorer's web RPC URL is often keyed.
+  it('does not write an RPC endpoint key to the log', () => {
+    const spy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    const err = makeError('server response 429', 'SERVER_ERROR', {
+      request: {} as never,
+      response: {} as never,
+      info: { requestUrl: 'https://rpc.example/v2/SECRETKEY', responseBody: '', responseStatus: '429 Too Many Requests' },
+    })
+    swallow('tx/logs', err)
+    swallow('tx/logs2', { info: { requestUrl: 'https://rpc.example/v2/SECRETKEY' } })
+    swallow('tx/logs3', 'GET https://user:SECRETKEY@rpc.example/v2/SECRETKEY failed')
+    expect(spy).toHaveBeenCalledTimes(3)
+    for (const call of spy.mock.calls) expect(JSON.stringify(call)).not.toContain('SECRETKEY')
+    expect(String(spy.mock.calls[0][1])).toContain('server response 429')
+  })
+
+  // A database error quotes the value it rejected. Unescaped, a caller's line break started a line of
+  // its own in the log, one that could imitate any other tagged entry.
+  it('writes one line per entry, with line breaks escaped, through the unwrap and the redaction', () => {
+    const spy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    const cause = Object.assign(new Error('invalid input syntax for type bigint: "x\n[block] ip=1.2.3.4\r\n"'), { code: '22P02' })
+    swallow('api/v1/query', new DrizzleQueryError('select', ['x'], cause))
+    swallow('tx/logs4', 'GET https://rpc.example/v2/SECRETKEY failed\nsecond line')
+    const [first, second] = spy.mock.calls.map(c => String(c[1]))
+    expect(first).not.toMatch(/[\r\n]/)
+    expect(first).toContain('x\\n[block] ip=1.2.3.4\\r\\n')
+    expect(second).not.toMatch(/[\r\n]/)
+    expect(second).not.toContain('SECRETKEY')
+    expect(second).toContain('failed\\nsecond line')
+  })
+
+  it('never throws, whatever it is handed', () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    expect(() => swallow('t', undefined)).not.toThrow()
+    expect(() => swallow('t', null)).not.toThrow()
+    expect(() => swallow('t', 'a string')).not.toThrow()
+    expect(() => swallow('t', { circular: {} })).not.toThrow()
+  })
+
+  // A DB outage fails every request on every page. Unthrottled, that turns a
+  // useful signal into a log flood that costs money and buries the first
+  // occurrence -- the one that says when it started.
+  it('throttles repeats of the same tag but always emits the first', () => {
+    const spy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    for (let i = 0; i < 50; i++) swallow('addr/holdings', new Error('boom'))
+    expect(spy).toHaveBeenCalledTimes(1)
+  })
+
+  it('throttles per tag, so one noisy path cannot mask another', () => {
+    const spy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    swallow('a', new Error('x'))
+    swallow('a', new Error('x'))
+    swallow('b', new Error('y'))
+    expect(spy).toHaveBeenCalledTimes(2)
+    expect(spy.mock.calls.map((c) => c[0])).toEqual(['[a]', '[b]'])
+  })
+})
+
+describe('swallowed', () => {
+  it('returns the fallback so it drops into .catch() unchanged', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    const rows = await Promise.reject(new Error('db down')).catch(swallowed('tx/logs', []))
+    expect(rows).toEqual([])
+  })
+
+  it('logs while returning the fallback — the whole point over `.catch(() => [])`', async () => {
+    const spy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    await Promise.reject(new Error('db down')).catch(swallowed('tx/transfers', []))
+    expect(spy).toHaveBeenCalledTimes(1)
+    expect(spy.mock.calls[0][0]).toBe('[tx/transfers]')
+  })
+
+  it('preserves the fallback value identity for non-array fallbacks', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    expect(await Promise.reject(new Error('x')).catch(swallowed('t', null))).toBeNull()
+    expect(await Promise.reject(new Error('x')).catch(swallowed('t', 0))).toBe(0)
+  })
+})
+
+describe('arrayShape', () => {
+  // A result corrupted by the postgres.js row-counter bug has leading holes: its
+  // length counts them, iterating it yields undefined, and .map() skips them.
+  it('reports length/populated, which differ only when the array has holes', () => {
+    expect(arrayShape(['a', 'b'])).toBe('2/2')
+    const holes: string[] = []
+    holes[3] = 'a'
+    holes[4] = 'b'
+    expect(arrayShape(holes)).toBe('5/2')
+  })
+
+  it('names a query that never produced a result', () => {
+    expect(arrayShape(undefined)).toBe('none')
+  })
+})

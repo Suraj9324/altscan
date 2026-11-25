@@ -1,0 +1,143 @@
+# Altscan — single-chain Render blueprint (self-hosting template).
+#
+# This is NOT the file that deploys bnbscan.com / ethscan.io — that is the
+# production two-chain config in the repository root (`render.yaml`). This one is a
+# minimal starting point for deploying your own explorer.
+#
+# ── How to use ───────────────────────────────────────────────────────────────
+#   1. Fork this repository.
+#   2. Copy this file over the root render.yaml in your fork:
+#        cp deploy/render/blueprint.yaml render.yaml
+#   3. Edit CHAIN and NEXT_PUBLIC_CHAIN below (both must match).
+#   4. In Render: New → Blueprint → select your fork.
+#   5. Set the RPC URL (and optionally MORALIS_API_KEY) when prompted.
+#
+# Plans below are modest defaults. Check current Render pricing before deploying —
+# a chain-tip indexer plus Postgres is not free to run continuously.
+
+services:
+  - type: web
+    name: altscan-web
+    env: node
+    plan: starter
+    rootDir: apps/explorer
+    buildCommand: >-
+      cd ../.. && pnpm install --frozen-lockfile &&
+      pnpm --filter @altscan/explorer build &&
+      cp -r apps/explorer/.next/static apps/explorer/.next/standalone/apps/explorer/.next/static
+    startCommand: cd .next/standalone/apps/explorer && node server.js
+    healthCheckPath: /api/ping
+    autoDeploy: true
+    envVars:
+      # ⚠ CHAIN and NEXT_PUBLIC_CHAIN must match. NEXT_PUBLIC_CHAIN is inlined into
+      # the browser bundle at build time; a mismatch renders the wrong chain's
+      # currency and theme against the other chain's data.
+      - key: CHAIN
+        value: bnb
+      - key: NEXT_PUBLIC_CHAIN
+        value: bnb
+      # For CHAIN=eth, rename this key to ETH_DATABASE_URL — getChainConfig() selects
+      # the database env var by chain and will not find DATABASE_URL on an eth build.
+      - key: DATABASE_URL
+        fromDatabase:
+          name: altscan-db
+          property: connectionString
+      - key: REDIS_URL
+        fromService:
+          type: redis
+          name: altscan-redis
+          property: connectionString
+      # For CHAIN=eth, rename this key to ETH_RPC_URL (here and on the indexer).
+      - key: BNB_RPC_URL
+        sync: false
+      - key: MORALIS_API_KEY
+        sync: false
+      - key: NODE_ENV
+        value: production
+      - key: DB_POOL_SIZE
+        value: "3"
+      - key: DB_STATEMENT_TIMEOUT_MS
+        value: "15000"
+      - key: HOSTNAME
+        value: "0.0.0.0"
+
+  - type: worker
+    name: altscan-indexer
+    env: node
+    plan: starter
+    rootDir: apps/indexer
+    # Every workspace package the indexer require()s at runtime ships compiled
+    # CommonJS (main: ./dist/*.js) and dist/ is gitignored, so each one must be
+    # BUILT here or the module is simply absent on the box. explorer-core and
+    # providers load lazily (only when BACKFILL_ENABLED=true), so omitting them
+    # fails at BOOT the first time backfill is enabled, not at deploy — that is
+    # exactly how the production indexers died on 2026-08-07 with "Cannot find
+    # module .../@altscan/providers/dist/index.js".
+    # ORDER MATTERS: chain-config first (providers type-imports it), then
+    # explorer-core (providers value-imports it), then providers.
+    # The trailing assertions are the point, and match render.yaml and
+    # docker/Dockerfile.indexer: apps/indexer's build was once `tsc || true` with
+    # noEmitOnError:false, so a build could report SUCCESS while emitting nothing.
+    # This asserts the artifact exists, parses, and that every workspace package
+    # the runtime require()s actually resolves — and the require.resolve check
+    # fails the build if chain-config's entry is ever a non-.js file again, which
+    # would only load via Node type-stripping and is pinned by nothing.
+    buildCommand: >-
+      cd ../.. && pnpm install --frozen-lockfile &&
+      pnpm --filter @altscan/chain-config build &&
+      pnpm --filter @altscan/explorer-core build &&
+      pnpm --filter @altscan/providers build &&
+      pnpm --filter @altscan/db build &&
+      pnpm --filter @altscan/indexer build &&
+      test -s apps/indexer/dist/index.js &&
+      node --check apps/indexer/dist/index.js &&
+      test -s packages/chain-config/dist/index.js &&
+      test -s packages/explorer-core/dist/index.js &&
+      test -s packages/providers/dist/index.js &&
+      cd apps/indexer &&
+      node -e "const p=require.resolve('@altscan/chain-config'); if(!p.endsWith('.js')) throw new Error('[build-check] chain-config resolves to '+p+', expected compiled .js'); require('@altscan/chain-config'); require('@altscan/providers'); console.log('[build-check] chain-config -> '+p+' loads; @altscan/providers loads (transitively proves explorer-core)')"
+    startCommand: node dist/index.js
+    autoDeploy: true
+    envVars:
+      - key: CHAIN
+        value: bnb
+      # For CHAIN=eth, rename to ETH_DATABASE_URL, as on the web service.
+      - key: DATABASE_URL
+        fromDatabase:
+          name: altscan-db
+          property: connectionString
+      - key: REDIS_URL
+        fromService:
+          type: redis
+          name: altscan-redis
+          property: connectionString
+      # For CHAIN=eth, rename to ETH_RPC_URL.
+      - key: BNB_RPC_URL
+        sync: false
+      # ⚠ SET THIS. Leaving it unset starts at block 38,000,000 on BNB or block 0 on
+      # ETH — tens of millions of blocks behind the head. Use a recent block number:
+      #   curl -s -X POST <your-rpc-url> -H 'content-type: application/json' \
+      #     -d '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
+      # (the result is hex; subtract ~1000 for a little history on first load)
+      - key: START_BLOCK
+        sync: false
+      - key: RETENTION_DAYS
+        value: "7"
+      - key: DB_POOL_SIZE
+        value: "8"
+      - key: NODE_ENV
+        value: production
+
+  - type: redis
+    name: altscan-redis
+    plan: starter
+    ipAllowList: []
+
+databases:
+  - name: altscan-db
+    databaseName: altscan
+    user: altscan
+    # Private network only. Omitting the key means 0.0.0.0/0 for Postgres; both
+    # services reach the DB through its internal connectionString.
+    ipAllowList: []
+    plan: basic-1gb

@@ -1,0 +1,82 @@
+/**
+ * Make swallowed failures visible.
+ *
+ * The explorer had 120 bare `catch {}` blocks and 6 logging sites, so roughly
+ * every failure path was invisible. That is not theoretical: the Whale Tracker
+ * broke on both chains and the page simply rendered an empty table — there was
+ * nothing in the Render logs to grep for, so an empty state was read as "no
+ * whales" rather than "the query is failing".
+ *
+ * Graceful degradation is still the right behaviour for a page. What was wrong
+ * was degrading *silently*. These helpers keep the degradation and add signal.
+ *
+ * Tags follow the convention already used in a handful of places — a bracketed
+ * lowercase path like `[tx/logs]` or `[addr/holdings]` — so a failing page can
+ * be found with a single `?text=` query against the Render logs.
+ */
+
+import { inspect } from 'node:util'
+import { unwrapDbError } from '@altscan/db'
+import { redactSecrets } from './redact'
+
+/**
+ * First occurrence per tag is always emitted; repeats are suppressed for this
+ * long. A DB outage fails every request on every page, and an unthrottled log
+ * buries the first occurrence — the one that says when it started.
+ */
+const THROTTLE_MS = 60_000
+const lastLoggedAt = new Map<string, number>()
+
+/** Test seam. Not for production use. */
+export function resetSwallowThrottle(): void {
+  lastLoggedAt.clear()
+}
+
+/** Log a swallowed error under `[tag]`. Never throws. */
+export function swallow(tag: string, err: unknown): void {
+  try {
+    const now = Date.now()
+    const last = lastLoggedAt.get(tag)
+    if (last !== undefined && now - last < THROTTLE_MS) return
+    lastLoggedAt.set(tag, now)
+    // Bound the map: tags are static strings in source, so this cannot grow
+    // unbounded in practice, but a defensive cap costs nothing.
+    if (lastLoggedAt.size > 500) lastLoggedAt.clear()
+    // A failed query logs what the database said, not drizzle's SQL-and-params wrapper.
+    const e = unwrapDbError(err)
+    // Formatted to a string and scrubbed: an ethers RPC error carries the keyed
+    // endpoint as `requestUrl` in both its message and its `info`, and handing
+    // console.error the object itself would print that too.
+    const text = e instanceof Error ? e.stack ?? e.message : typeof e === 'string' ? e : inspect(e)
+    // One line per entry. A database error quotes the value it rejected, so a caller's CR or
+    // LF could otherwise start a line of its own that imitates any other tagged entry.
+    console.error(`[${tag}]`, redactSecrets(text).replace(/\r/g, '\\r').replace(/\n/g, '\\n'))
+  } catch {
+    // Logging must never be able to break the page it is reporting on.
+  }
+}
+
+/**
+ * `length/populated` for a query result, e.g. `5/2`. The two differ only when
+ * the array has holes — the signature of a result corrupted by the postgres.js
+ * row-counter bug (patches/postgres@3.4.8.patch), where for-of yields
+ * `undefined` for every hole. `none` when there is no result at all.
+ */
+export function arrayShape(rows: ArrayLike<unknown> | undefined): string {
+  return rows === undefined ? 'none' : `${rows.length}/${Object.keys(rows).length}`
+}
+
+/**
+ * Drop-in for `.catch(() => fallback)` that logs first.
+ *
+ *   db.select()...            .catch(() => [])
+ *   db.select()...            .catch(swallowed('tx/logs', []))
+ *
+ * Same degradation, same value, now greppable.
+ */
+export function swallowed<T>(tag: string, fallback: T): (err: unknown) => T {
+  return (err: unknown) => {
+    swallow(tag, err)
+    return fallback
+  }
+}

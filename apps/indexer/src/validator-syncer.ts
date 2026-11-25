@@ -1,0 +1,189 @@
+import { Contract, formatEther } from 'ethers'
+import { getDb, schema } from './db'
+import { getProvider, safeRpcError } from './provider'
+import { STAKE_HUB_ABI, STAKE_HUB_ADDRESS, buildValidatorWrite } from './validator-stakehub'
+
+const provider = getProvider()
+
+// BSC ValidatorSet contract — returns current active validators
+const VALIDATOR_SET_ADDRESS = '0x0000000000000000000000000000000000001000'
+const VALIDATOR_SET_ABI = [
+  'function getValidators() view returns (address[])',
+  'function currentValidatorSetMap(address) view returns (uint256)',
+]
+
+// BSC StakeHub contract (BEP-294 / Fusion) — address + ABI in ./validator-stakehub
+
+// Known validator names as fallback (top BSC validators by consensus address)
+const KNOWN_VALIDATORS: Record<string, string> = {
+  '0x2465176c461afb316ebc773c61faee85a6515daa': 'BNB48 Club',
+  '0x295e26495cef6f69dfa69911d9d8e4f3bbadb89b': 'Legend',
+  '0x72b61c6014342d914470ec7ac2975be345796c2b': 'Defibit',
+  '0x9f8ccdafcc39f3c7d6ebf637c9151673cbc36b88': 'Ankr',
+  '0x35ead5abe76b0c3a9b0e4d0ca82d27d2c2e2086d': 'NodeReal',
+  '0x8b6c8fd93d6f4cea42bbb345dbc6f0dfdb5bec73': 'InfStones',
+  '0x2d4c407bbe49438ed859fe965b140dcf1aab71a9': 'MathWallet',
+  '0xe9ae3261a475a27bb1028f140bc2a7c843318afd': 'Certik',
+  '0xee226379db83cffc681495730c11fdde79ba4c0c': 'Avenger',
+  '0xef0274e31810c9df02f98fafde0f841f4e66a1cd': 'TW Staking',
+  '0xbe807dddb074639cd9fa61b47676c064fc50d62c': 'Legend II',
+  '0x3f349bbafec1551819b8be1efea2fc46ca749aa1': 'BNB48 Club II',
+  '0x685b1ded8013785d6623cc18d214320b6bb64759': 'Seoraksan',
+  '0x70f657164e5b75689b64b7fd1fa275f334f28e18': 'Fuji',
+  '0x4396e28197653d0c244d95f8c1e57da902a72b4e': 'BSCLotto',
+}
+
+/**
+ * Try StakeHub first (has voting power), fall back to ValidatorSet (active list only)
+ */
+export async function syncValidators(): Promise<void> {
+  console.log('[validator-syncer] Starting sync...')
+  const db = getDb()
+
+  // Attempt 1: StakeHub with election info (has voting power data)
+  try {
+    const stakeHub = new Contract(STAKE_HUB_ADDRESS, STAKE_HUB_ABI, provider)
+    const result = await stakeHub.getValidatorElectionInfo(0, 100)
+    const consensusAddrs: string[] = Array.from(result[0])
+    const votingPowers: bigint[] = Array.from(result[1])
+
+    console.log(`[validator-syncer] StakeHub returned ${consensusAddrs.length} validators`)
+
+    if (consensusAddrs.length > 0) {
+      // StakeHub returns consensus addresses, but getValidatorDescription needs
+      // operator addresses. Resolve the mapping first.
+      const operatorMap = await resolveOperatorAddresses(stakeHub, consensusAddrs)
+      await upsertValidators(db, stakeHub, consensusAddrs, votingPowers, operatorMap)
+      return
+    }
+    console.warn('[validator-syncer] StakeHub returned 0 validators, falling back to ValidatorSet')
+  } catch (err) {
+    console.warn('[validator-syncer] StakeHub failed, falling back to ValidatorSet:', safeRpcError(err))
+  }
+
+  // Attempt 2: ValidatorSet contract (simpler, always works)
+  try {
+    const validatorSet = new Contract(VALIDATOR_SET_ADDRESS, VALIDATOR_SET_ABI, provider)
+    const validators: string[] = Array.from(await validatorSet.getValidators())
+    console.log(`[validator-syncer] ValidatorSet returned ${validators.length} validators`)
+
+    if (validators.length === 0) {
+      console.warn('[validator-syncer] ValidatorSet returned 0 validators — nothing to sync')
+      return
+    }
+
+    // No voting power from this contract — use equal weight
+    const equalPower = Array(validators.length).fill(0n) as bigint[]
+    await upsertValidators(db, null, validators, equalPower, new Map())
+  } catch (err) {
+    console.error('[validator-syncer] Both methods failed:', safeRpcError(err))
+  }
+}
+
+/**
+ * Resolve consensus addresses → operator addresses via StakeHub.
+ * The description/commission RPC calls require operator addresses, not consensus.
+ */
+async function resolveOperatorAddresses(
+  stakeHub: Contract,
+  consensusAddrs: string[],
+): Promise<Map<string, string>> {
+  const map = new Map<string, string>()
+  let resolved = 0
+  let failed = 0
+  let firstFailure: string | null = null
+
+  // Batch in groups of 10 to avoid RPC rate limits
+  for (let i = 0; i < consensusAddrs.length; i += 10) {
+    const batch = consensusAddrs.slice(i, i + 10)
+    const results = await Promise.allSettled(
+      batch.map(addr => stakeHub.consensusToOperator(addr))
+    )
+    for (let j = 0; j < results.length; j++) {
+      const r = results[j]
+      if (r.status === 'fulfilled' && r.value && r.value !== '0x0000000000000000000000000000000000000000') {
+        map.set(batch[j].toLowerCase(), (r.value as string).toLowerCase())
+        resolved++
+      } else {
+        failed++
+        // Surface why. Without this the counter alone hid a reverting selector
+        // for weeks: every failure looked identical to a zero-address result.
+        if (!firstFailure) {
+          firstFailure = r.status === 'rejected'
+            ? `${(r.reason as { code?: string })?.code ?? 'error'}: ${
+                (r.reason as { shortMessage?: string; message?: string })?.shortMessage
+                ?? (r.reason as Error)?.message ?? String(r.reason)}`
+            : `returned zero address for ${batch[j]}`
+        }
+      }
+    }
+  }
+
+  console.log(`[validator-syncer] Resolved ${resolved}/${consensusAddrs.length} operator addresses (${failed} failed)`)
+  if (firstFailure) {
+    console.warn(`[validator-syncer] first operator-resolution failure — ${safeRpcError(firstFailure)}`)
+  }
+  return map
+}
+
+async function upsertValidators(
+  db: ReturnType<typeof getDb>,
+  stakeHub: Contract | null,
+  validators: string[],
+  votingPowers: bigint[],
+  operatorMap: Map<string, string>,
+): Promise<void> {
+  const totalPower = votingPowers.reduce((sum, vp) => sum + vp, 0n)
+  const now = new Date()
+  let upserted = 0
+  let descResolved = 0
+
+  for (let i = 0; i < validators.length; i++) {
+    const addr = validators[i].toLowerCase()
+    const vp = votingPowers[i] ?? 0n
+
+    // On-chain moniker/commission via the operator address. A failed read stays null
+    // (unknown) — buildValidatorWrite decides what that means for the row.
+    let chainMoniker: string | null = null
+    let commissionRate: bigint | null = null
+
+    if (stakeHub) {
+      const operatorAddr = operatorMap.get(addr)
+      if (operatorAddr) {
+        try {
+          const desc = await stakeHub.getValidatorDescription(operatorAddr)
+          if (desc.moniker && desc.moniker.length > 0) {
+            chainMoniker = desc.moniker
+            descResolved++
+          }
+        } catch { /* description not available for this operator */ }
+
+        try {
+          const comm = await stakeHub.getValidatorCommission(operatorAddr)
+          commissionRate = comm.rate
+        } catch { /* commission not available */ }
+      }
+    }
+
+    const write = buildValidatorWrite({
+      address: addr,
+      fallbackMoniker: KNOWN_VALIDATORS[addr] ?? `Validator ${i + 1}`,
+      chainMoniker,
+      commissionRate,
+      votingPower: vp,
+      now,
+    })
+
+    try {
+      await db.insert(schema.validators).values(write.values).onConflictDoUpdate({
+        target: [schema.validators.address],
+        set: write.update,
+      })
+      upserted++
+    } catch (err) {
+      console.warn('[validator-syncer] Failed to upsert validator:', addr, safeRpcError(err))
+    }
+  }
+
+  console.log(`[validator-syncer] Synced ${upserted}/${validators.length} validators (${descResolved} monikers from chain)${totalPower > 0n ? ` — total voting power: ${formatEther(totalPower)} BNB` : ''}`)
+}

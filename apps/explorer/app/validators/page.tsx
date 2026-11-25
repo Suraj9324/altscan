@@ -1,0 +1,131 @@
+import { db, schema } from '@/lib/db'
+import { desc } from 'drizzle-orm'
+import { formatNumber, safeBigInt } from '@/lib/format'
+import { Badge } from '@/components/ui/Badge'
+import Link from 'next/link'
+import { notFound } from 'next/navigation'
+import { chainConfig } from '@/lib/chain'
+import type { Metadata } from 'next'
+import { swallow } from '@/lib/observability'
+import { blocksProduced, minerCounts, validatorBlocksQuery, type MinerCount } from '@/lib/validator-blocks'
+import { formatCommission, validatorDisplays } from '@/lib/validator-display'
+import { producerLegend, producerStrip, producerSummary } from '@/lib/producers'
+import { TileStrip } from '@/components/tape/TileStrip'
+
+export const metadata: Metadata = {
+  title: `Validators`,
+  description: `${chainConfig.name} validator set — view validators, voting power, and commission rates on ${chainConfig.brandDomain}.`,
+  alternates: { canonical: '/validators' },
+}
+
+export const revalidate = 300
+
+/** Blocks each miner produced in the 24h before the newest block; null if the query fails. */
+async function fetchBlocks24h(): Promise<Map<string, number> | null> {
+  try {
+    const rows = await db.execute(validatorBlocksQuery())
+    return minerCounts(Array.from(rows) as unknown as MinerCount[])
+  } catch (e) {
+    swallow('validators/blocks24h', e)
+    return null
+  }
+}
+
+export default async function ValidatorsPage() {
+  if (!chainConfig.features.hasValidators) return notFound()
+
+  let validators: typeof schema.validators.$inferSelect[] = []
+  try {
+    validators = await db.select().from(schema.validators)
+      .orderBy(desc(schema.validators.votingPower))
+      .limit(100)
+  } catch (e) { swallow('validators/query', e) }  // DB not connected
+  const blockCounts = validators.length > 0 ? await fetchBlocks24h() : null
+  const display = validatorDisplays(validators, blockCounts)
+  const blocksCell = (address: string) => {
+    const n = blocksProduced(blockCounts, address)
+    return n === null ? '—' : formatNumber(n)
+  }
+  // The strip reads the same per-miner counts as the Blocks (24h) column: one reading, drawn twice.
+  const strip = producerStrip(
+    validators.map((v, i) => ({
+      address: v.address,
+      name: display[i].name,
+      power: display[i].powerUnknown ? null : safeBigInt(v.votingPower),
+    })),
+    blockCounts,
+    chainConfig.currency,
+  )
+
+  return (
+    <>
+    <div className="max-w-7xl mx-auto px-4 pt-8">
+      <div className="mb-5">
+        <p className="k">{'// '}validators</p>
+        <h1 className="mt-2 text-[clamp(26px,3.4vw,40px)] font-bold leading-[1.05] tracking-[-0.03em] text-ink">
+          {chainConfig.name} Validators{validators.length > 0 ? ` (${validators.length})` : ''}
+        </h1>
+      </div>
+    </div>
+
+    {strip && (
+      <TileStrip
+        rowsId="validators-rows"
+        tiles={strip.tiles}
+        title="Validators"
+        stats={{ main: `${strip.producing} of ${strip.total} produced blocks`, side: 'last 24h' }}
+        label={`Validators, width is blocks produced${strip.fillKnown ? ', fill is voting power' : ''}`}
+        legend={producerLegend(strip.fillKnown)}
+        summary={producerSummary(strip)}
+      />
+    )}
+
+    <div className={`max-w-7xl mx-auto px-4 pb-8${strip ? ' pt-6' : ''}`}>
+      {validators.length === 0 ? (
+        <div className="rounded-xl border border-hair bg-card p-12 text-center">
+          <p className="mb-2 text-lg text-ink2">No validators synced yet</p>
+          <p className="text-sm text-mut">
+            Validator data will appear here once the indexer has synced {chainConfig.name} validator information.
+          </p>
+        </div>
+      ) : (
+      <div id="validators-rows" className="bg-card rounded-xl border border-hair overflow-hidden">
+        <div className="overflow-x-auto">
+        <table className="dt">
+          <caption className="sr-only">{chainConfig.name} validators ranked by voting power</caption>
+          <thead>
+            <tr>
+              <th scope="col">#</th>
+              <th scope="col">Validator</th>
+              <th scope="col">Status</th>
+              <th scope="col">Voting Power</th>
+              <th scope="col">Commission</th>
+              <th scope="col">Blocks (24h)</th>
+            </tr>
+          </thead>
+          <tbody>
+            {validators.map((v, i) => (
+              <tr key={v.address}>
+                <td className="text-mut">{i + 1}</td>
+                <td>
+                  <Link href={`/address/${v.address}`} prefetch={false} className="text-acc-ink font-medium hover:underline">
+                    {display[i].name}
+                  </Link>
+                </td>
+                <td className="whitespace-nowrap">
+                  <Badge variant={display[i].status.variant}>{display[i].status.label}</Badge>
+                </td>
+                <td className="whitespace-nowrap">{display[i].powerUnknown ? '—' : `${formatNumber(safeBigInt(v.votingPower) / 10n ** 18n)} ${chainConfig.currency}`}</td>
+                <td>{formatCommission(v.commission)}</td>
+                <td>{blocksCell(v.address)}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+        </div>
+      </div>
+      )}
+    </div>
+    </>
+  )
+}

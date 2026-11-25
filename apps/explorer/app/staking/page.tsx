@@ -1,0 +1,120 @@
+import Link from 'next/link'
+import { getWebProvider } from '@/lib/rpc'
+import { notFound } from 'next/navigation'
+import { chainConfig } from '@/lib/chain'
+import { AdReserve } from '@/components/ads/AdReserve'
+import type { Metadata } from 'next'
+import { swallow } from '@/lib/observability'
+import { formatCompact } from '@/lib/format'
+
+export const metadata: Metadata = {
+  title: 'Ethereum Staking',
+  description: `Ethereum staking — the ETH held by the ETH2 deposit contract (about the total ever deposited), and how staking works, on ${chainConfig.brandDomain}.`,
+  alternates: { canonical: '/staking' },
+}
+
+export const revalidate = 300
+
+if (!chainConfig.features.hasStaking) {
+  // Static guard -- will 404 at build time for non-staking chains
+}
+
+// The deposit contract only ever receives ETH (withdrawals are paid by the beacon chain, not
+// from it), so its balance is approximately everything ever deposited. Not exactly: ETH forced into it
+// without a deposit() call (a selfdestruct, a block reward) also raises the balance. It is not the amount
+// staked today.
+async function fetchDepositedEth(): Promise<number | null> {
+  try {
+    const DEPOSIT_CONTRACT = '0x00000000219ab540356cbb839cbe05303d7705fa'
+    const provider = await getWebProvider()
+    const balance = await provider.getBalance(DEPOSIT_CONTRACT)
+    return Number(balance) / 1e18
+  } catch (e) {
+    swallow('staking/query', e)
+    return null
+  }
+}
+
+export default async function StakingPage() {
+  if (!chainConfig.features.hasStaking) return notFound()
+
+  const deposited = await fetchDepositedEth()
+
+  const stakingFaqJsonLd = {
+    '@context': 'https://schema.org',
+    '@type': 'FAQPage',
+    mainEntity: [
+      { '@type': 'Question', name: 'What is Ethereum staking?', acceptedAnswer: { '@type': 'Answer', text: 'Validators stake at least 32 ETH to participate in block validation and earn rewards. Ethereum uses Proof of Stake consensus since The Merge (September 2022).' } },
+      { '@type': 'Question', name: 'How much ETH do I need to stake?', acceptedAnswer: { '@type': 'Answer', text: 'Running your own validator requires at least 32 ETH.' } },
+    ],
+  }
+
+  return (
+    <div className="max-w-7xl mx-auto px-4 py-8">
+      <script
+        type="application/ld+json"
+        dangerouslySetInnerHTML={{ __html: JSON.stringify(stakingFaqJsonLd) }}
+      />
+      <div className="mb-5">
+        <p className="k">{'// '}staking</p>
+        <h1 className="mt-2 text-[clamp(26px,3.4vw,40px)] font-bold leading-[1.05] tracking-[-0.03em] text-ink">Ethereum Staking</h1>
+        <p className="mt-2 max-w-3xl text-sm text-ink2">
+          Ethereum uses Proof of Stake consensus since The Merge (September 2022).
+          Validators stake at least 32 ETH to participate in block validation and earn rewards.
+          This page shows the ETH held by the ETH2 deposit contract, which is about the total ever deposited.
+        </p>
+      </div>
+
+      {/* Stats */}
+      <dl className="ledger [--cols:1] mb-6">
+        <StatCard
+          label="ETH held by the deposit contract (≈ total deposited)"
+          value={deposited
+            ? `${formatCompact(deposited)} ETH`
+            : '—'}
+          note="Balance of the ETH2 deposit contract. Deposits fill it and nothing pays out of it, but ETH sent to it without a deposit also counts here"
+        />
+      </dl>
+
+      <AdReserve
+        context="staking"
+        placement="staking_after_stats"
+        variant="compact"
+        className="mb-6"
+      />
+
+      {/* Deposit contract info */}
+      <div className="rounded-xl border border-hair bg-card p-4">
+        <h2 className="mb-3 text-lg font-semibold tracking-[-0.02em] text-ink">ETH2 Deposit Contract</h2>
+        <div className="flex flex-wrap items-center gap-x-4 gap-y-1 font-mono text-sm text-ink">
+          <span className="break-all">0x00000000219ab540356cbb839cbe05303d7705fa</span>
+          <Link
+            href="/address/0x00000000219ab540356cbb839cbe05303d7705fa"
+            prefetch={false}
+            className="text-xs text-acc-ink hover:underline"
+          >
+            View →
+          </Link>
+        </div>
+        <p className="mt-1 text-xs text-mut">
+          The canonical one-way deposit contract deployed on the Ethereum mainnet.
+          All validator deposits are made here.
+        </p>
+      </div>
+    </div>
+  )
+}
+
+function StatCard({ label, value, note }: {
+  label: string
+  value: string
+  note: string
+}) {
+  return (
+    <div>
+      <dt className="k">{label}</dt>
+      <dd className="mt-1 break-words font-mono text-[15px] text-ink">{value}</dd>
+      <dd className="mt-0.5 break-words text-xs text-mut">{note}</dd>
+    </div>
+  )
+}

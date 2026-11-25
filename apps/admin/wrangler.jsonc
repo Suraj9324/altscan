@@ -1,0 +1,28 @@
+{
+  "name": "altscan-admin",
+  "compatibility_date": "2025-01-01",
+  "compatibility_flags": ["nodejs_compat"],
+  // The ONLY hostname is the Access-protected custom domain — never expose the
+  // admin surface on an unprotected *.workers.dev / preview URL.
+  "workers_dev": false,
+  "preview_urls": false,
+  "main": "@astrojs/cloudflare/entrypoints/server",
+  "routes": [{ "pattern": "admin.altscan.io", "custom_domain": true }],
+  "observability": { "enabled": true },
+  "d1_databases": [
+    { "binding": "DB", "database_name": "altscan-admin", "database_id": "0e3ddd98-748f-403d-a836-95a40b23f5cd" }
+  ],
+  "r2_buckets": [
+    // House-ad creative images. Served publicly from creatives.altscan.io —
+    // NOT through this Worker, which sits behind CF Access and would 302 every
+    // <img> on the public explorer to the Access login page.
+    { "binding": "CREATIVES", "bucket_name": "altscan-house-creatives" }
+  ],
+  "vars": {
+    // Non-secret Access identifiers (team domain is public; AUD is an audience
+    // tag, not a credential — a forged JWT still fails the JWKS signature check).
+    // Empty here = prod fails closed 503. App: "Altscan Admin Console".
+    "CF_ACCESS_TEAM_DOMAIN": "wellingtonst",
+    "CF_ACCESS_AUD": "12e28d89b24f808b6fef38b19510577b6325da6dcb14eb5295b558f41ed9dcb8"
+  }
+}

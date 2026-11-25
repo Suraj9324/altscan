@@ -1,0 +1,816 @@
+import { cache } from 'react'
+import { db, schema } from '@/lib/db'
+import { eq, sql, inArray } from 'drizzle-orm'
+import { notFound } from 'next/navigation'
+import { headers } from 'next/headers'
+import { formatCompactUsd, formatNativeToken, formatNumber, formatUtc, timeAgo, groupDigits } from '@/lib/format'
+import { Badge } from '@/components/ui/Badge'
+import { CopyButton } from '@/components/ui/CopyButton'
+import { Icon } from '@/components/ui/Icon'
+import { Pagination } from '@/components/ui/Pagination'
+import Link from 'next/link'
+import type { Metadata } from 'next'
+import { getAddressLabel } from '@/lib/known-addresses'
+import { toChecksumAddress, addressHeadline } from '@/lib/address-display'
+import { resolveName } from '@/lib/name-resolver'
+import { getAddressRisk } from '@/lib/goplus'
+import { isBotRequest } from '@/lib/providers'
+import { getRetentionFloor, isLocalHistoryIncomplete } from '@/lib/retention'
+import { TxnsLazy } from './TxnsLazy'
+import { TxnsTable } from './TxnsTable'
+import { TransfersLazy } from './TransfersLazy'
+import { HoldingsTab, getTrackedBalances } from './HoldingsTab'
+import { NftsLazy } from './NftsLazy'
+import { TransferRow, type TransferTokenInfo } from './TransferRow'
+import { NftRow, type NftTransfer } from './NftRow'
+import { getWebProvider } from '@/lib/rpc'
+import { chainConfig } from '@/lib/chain'
+import { WatchlistButton } from '@/components/ui/WatchlistButton'
+import { classifyCode, resolveContractStatusFromClass, resolveNativeBalance, type CodeClass } from '@/lib/contract-status'
+import { codeClassCache } from '@/lib/code-cache'
+import { AbiReader } from '@/components/contracts/AbiReader'
+import { AdReserve } from '@/components/ads/AdReserve'
+import { AddressLedger } from '@/components/tape/AddressLedger'
+import { toLedgerRows } from '@/lib/ledger'
+import { AddressLink } from '@/components/ui/AddressLink'
+import { swallow } from '@/lib/observability'
+import { selectByAddress } from '@/lib/address-query'
+import { nftTransfersQuery } from '@/lib/nft-transfers'
+import { clampListPage, MAX_LIST_ROWS } from '@/lib/list-depth'
+import { fetchNativeUsd } from '@/lib/native-price'
+import { priceTracked, trackedClause, trackedTokens } from '@/lib/holdings'
+import { FLOW_SAMPLE_CAP, flowLabel, flowValue, parseFlowRow, type FlowSample } from '@/lib/address-analytics'
+import { resolveTxCount } from '@/lib/address-tx-count'
+
+export const revalidate = 300
+
+// One DB+RPC lookup per request, shared by generateMetadata and the page render
+// (cache() dedupes), so the <title>, the meta description and the page body can
+// never disagree about what this address is.
+//
+// Contract-ness is derived HERE rather than read from addresses.is_contract,
+// which is always false — see lib/contract-status.ts for why, and why fixing it
+// at index time is not viable. The getCode call rides along in an RPC batch the
+// page already issued, and its verdict is cached across requests, so a repeat
+// visit to the same address costs no extra call at all.
+const getAddressChainState = cache(async (addr: string) => {
+  let contract: typeof schema.contracts.$inferSelect | null = null
+  try {
+    const [row] = await db.select().from(schema.contracts).where(eq(schema.contracts.address, addr)).limit(1)
+    contract = row ?? null
+  } catch (e) { swallow('addr/contract-registry', e) }  // DB error — registry signal unavailable, getCode still decides
+
+  // Contract-ness is near-immutable, so its verdict is cached ACROSS requests;
+  // balance and nonce are not. This page reads searchParams and headers(), so it
+  // renders dynamically on every hit and `revalidate = 300` never bounded the
+  // RPC cost — a crawler sweep paid for getCode on every single address.
+  const cached = codeClassCache.get(addr)
+  let cls: CodeClass | null = cached ?? null
+  let live: bigint | null = null
+  let nonce: number | null = null
+  try {
+    const provider = await getWebProvider()
+    const [b, n, rawCode] = await Promise.all([
+      provider.getBalance(addr).catch(() => null),
+      provider.getTransactionCount(addr).catch(() => null),   // nonce = outgoing tx count (free RPC)
+      cached ? Promise.resolve<string | null>(null) : provider.getCode(addr).catch(() => null),
+    ])
+    live = b
+    nonce = n
+    if (!cached && rawCode !== null) {
+      cls = classifyCode(rawCode)
+      // Never cache a broken answer — a transient outage must not pin a wrong
+      // verdict for the whole TTL.
+      if (cls !== 'malformed') codeClassCache.set(addr, cls)
+    }
+  } catch (e) { swallow('addr/chain-state', e) }  // provider unavailable — every field stays null and resolves to unknown
+
+  return {
+    contract,
+    status: resolveContractStatusFromClass({ cls, verified: contract !== null }),
+    balance: resolveNativeBalance({ live, indexed: null }),
+    nonce,
+  }
+})
+
+const ADDRESS_REGEX = /^0x[0-9a-fA-F]{40}$/
+
+export async function generateMetadata({ params }: { params: Promise<{ address: string }> }): Promise<Metadata> {
+  const { address } = await params
+  // Validate BEFORE any lookup: the chain-state read below hands the string to the RPC provider,
+  // and on ETH ethers resolves an ENS-like name ("vitalik.eth") rather than rejecting it, so a
+  // crawler's garbage URL would cost RPC calls. The page body 404s the same input. noindex
+  // rather than notFound(), which cannot set a reliable status from metadata (see the tx page).
+  if (!ADDRESS_REGEX.test(address)) {
+    return { title: 'Address Not Found', robots: { index: false, follow: false } }
+  }
+  let info: typeof schema.addresses.$inferSelect | null = null
+  try {
+    const [row] = await db.select().from(schema.addresses).where(eq(schema.addresses.address, address.toLowerCase())).limit(1)
+    info = row ?? null
+  } catch (e) { swallow('addr/metadata', e) }  // DB error
+  const { status, balance, nonce } = await getAddressChainState(address.toLowerCase())
+  // No row (or a failed read) is no count: say nothing rather than "0 transactions".
+  const txs = resolveTxCount({ indexed: info ? info.txCount : null, nonce: status.isContract ? null : nonce })
+  // Only claim "Contract" when we actually know. An unknown address keeps the
+  // neutral wording rather than being mislabelled an EOA.
+  const type = status.isContract ? 'Contract' : 'Address'
+  // ⚠ Never interpolate a balance we do not have. This used to read
+  // addresses.balance, a column fixed at '0', so EVERY address page advertised
+  // "Balance: 0 BNB" to crawlers regardless of what the address actually held.
+  const balanceText = balance.known
+    ? `Balance: ${formatNativeToken(balance.value)} ${chainConfig.currency}`
+    : `Balance unavailable`
+  return {
+    // No brand suffix: the layout title template (`%s — ${brandDomain}`) appends it
+    title: `${type} ${address.slice(0, 14)}…`,
+    description: `${chainConfig.name} ${type.toLowerCase()} ${address} — ${balanceText}${txs.known ? `, ${txs.text} ${txs.total === 1 ? 'transaction' : 'transactions'}` : ''}`,
+    alternates: { canonical: `/address/${address.toLowerCase()}` },
+    openGraph: {
+      title: `${type} ${address.slice(0, 14)}…`,
+      description: balanceText,
+    },
+  }
+}
+
+const PAGE_SIZE = 25
+
+// Kicker-style column header, matching components/transactions/TxTable.
+const TH = 'text-left px-3 sm:px-4 py-2 font-mono text-[11px] font-medium uppercase tracking-[0.06em] text-mut'
+
+export default async function AddressPage({
+  params,
+  searchParams,
+}: {
+  params: Promise<{ address: string }>
+  searchParams: Promise<{ tab?: string; page?: string; cursor?: string }>
+}) {
+  const { address } = await params
+  const { tab, page: pageStr, cursor } = await searchParams
+  const addr = address.toLowerCase()
+  // The tabs stop at the newest MAX_LIST_ROWS rows, so a deeper ?page= gets its last page.
+  const page = clampListPage(parseInt(pageStr ?? '1', 10) || 1, PAGE_SIZE)
+  const offset = (page - 1) * PAGE_SIZE
+
+  if (!ADDRESS_REGEX.test(addr)) notFound()
+
+  // `addr` stays lowercase for every DB lookup and href; only display
+  // and the copy button use the checksummed form.
+  const checksummedAddr = toChecksumAddress(addr)
+
+  // Always fetch address info and contract info.
+  // txCount and firstSeen come from the addresses table (instant PK lookup)
+  // instead of COUNT(*)/MIN(timestamp) on 36M-row transactions table (OOM risk).
+  let addressInfo: typeof schema.addresses.$inferSelect | null = null
+
+
+  try {
+    // The contracts row now comes from getAddressChainState so the badge, the
+    // Contract section and the page <title> all read one resolved answer.
+    ;[addressInfo] = await Promise.all([
+      db
+        .select()
+        .from(schema.addresses)
+        .where(eq(schema.addresses.address, addr))
+        .limit(1)
+        .then((r) => r[0] ?? null),
+    ])
+  } catch (e) {
+    swallow('addr/info', e)
+    // DB not connected
+  }
+
+  const firstTxTimestamp = addressInfo?.firstSeen ?? null
+
+  // Enrich with external data — split into two batches to reduce peak memory.
+  // Batch 1: lightweight lookups. Batch 2: heavier RPC + Moralis calls.
+  // Bot-gate Moralis: crawlers sweep many DISTINCT idle addresses, and each one is a Moralis cache
+  // miss → a billed API call, which exhausts the free CU budget so real users dead-end. This page
+  // already reads searchParams, so it is dynamically rendered (cache-control: private, no-cache) —
+  // reading headers() forfeits no caching that was actually in effect. Bots get the local-index
+  // view; humans still get the Moralis fallback. (The transfers/holdings/nfts tabs already honor this.)
+  const isBot = isBotRequest((await headers()).get('user-agent'))
+
+  // Batch 1: lightweight lookups (name resolution, risk check, price)
+  const [resolvedName, riskData, nativePrice] = await Promise.all([
+    resolveName(addr),
+    getAddressRisk(addr),
+    fetchNativeUsd(),
+  ])
+
+  // Batch 2: heavier RPC calls (after batch 1 frees its memory).
+  // Moralis txn history is now fetched lazily on the client via TxnsLazy — no SSR prefetch,
+  // so HTML scrapers (fake browser UAs, no JS) never trigger getWalletHistory during render.
+  // The tracked tokens' live balances ride in the same batch (one more RPC read, no Moralis); the
+  // lead sentence and the Holdings tab share it through cache().
+  const [{ contract: contractResult, status: contractStatus, balance, nonce: rpcTxCount }, trackedBalances] =
+    await Promise.all([getAddressChainState(addr), getTrackedBalances(addr)])
+  const trackedRows = trackedBalances ? priceTracked(trackedTokens(chainConfig.whales), trackedBalances, nativePrice) : []
+  const trackedText = trackedClause(trackedRows)
+  // ⚠ No fallback to addressInfo.balance: that column is a literal '0' nothing
+  // maintains, so falling back turned an RPC blip into a confident wrong zero.
+  const displayBalance = balance.value
+  const balanceKnown = balance.known
+  // Transaction count: the index's, or unknown. The RPC nonce counts only OUTGOING transactions,
+  // so it is never presented as the total (lib/address-tx-count.ts); it is labelled on the fact
+  // instead. Moralis history is loaded lazily on the client, so it is not available here.
+  const txDisplay = resolveTxCount({
+    indexed: addressInfo ? addressInfo.txCount : null,
+    nonce: contractStatus.isContract ? null : rpcTxCount,   // a contract's nonce counts contracts it created
+  })
+  const displayTxCount = txDisplay.total
+  const displayFirstSeen = addressInfo?.firstSeen
+    ? new Date(addressInfo.firstSeen)
+    : null
+  // No index row: the tab says history is not in the local index, so a bare "0" here
+  // would claim a count we do not have.
+  const txCountText = txDisplay.text
+  // USD value of native token balance
+  const nativeUsd = balanceKnown && nativePrice && displayBalance
+    ? (Number(displayBalance) / 1e18 * nativePrice)
+    : null
+
+  const activeTab = tab ?? 'txns'
+  const lowGasBalanceWei = BigInt(chainConfig.lowGasBalanceWei)
+  // Only pitch gas top-ups on a balance we actually read. An unknown balance is
+  // not a zero balance, and pitching on a failed lookup is a wrong ad.
+  const gasReferralContext = !balanceKnown
+    ? null
+    : displayBalance === 0n
+      ? 'address_zero_balance'
+      : displayBalance < lowGasBalanceWei
+        ? 'address_low_balance'
+        : null
+
+  // The page leads with what the address IS: its curated label, else its kind and a shortened form.
+  // The kind is only claimed when the RPC answered (status.known). A resolved ENS/.bnb name is
+  // self-chosen, so it is never the headline (see addressHeadline); it stays a badge below.
+  const kind = contractStatus.isContract ? 'Contract' : contractStatus.known ? 'Wallet' : 'Address'
+  // `||`, not `??`: an empty label is no label (it would print as a blank h1).
+  const label = addressInfo?.label || getAddressLabel(addr)
+  const headline = addressHeadline({ label, kind, checksummed: checksummedAddr })
+
+  return (
+    <div className="max-w-7xl mx-auto px-4 py-8">
+      {/* No verdict is not a clean bill: say the check did not run, rather than show nothing. */}
+      {riskData === null && (
+        <p className="mb-4 text-xs text-mut">Security check unavailable: GoPlus did not return a verdict for this address.</p>
+      )}
+      {/* GoPlus risk warning */}
+      {riskData && (riskData.isMalicious || riskData.isPhishing || riskData.isBlacklist) && (
+        <div className="mb-4 flex items-start gap-3 rounded-xl border border-hair border-l-[3px] border-l-warn bg-card px-4 py-3">
+          <Icon name="danger" className="mt-0.5 h-5 w-5 text-warn" />
+          <div>
+            <p className="font-semibold text-ink text-sm">Security Risk Detected</p>
+            <ul className="mt-1 space-y-0.5">
+              {riskData.riskItems.map(item => (
+                <li key={item} className="text-xs text-ink2">• {item}</li>
+              ))}
+            </ul>
+            <p className="text-xs text-mut mt-1">Source: GoPlus Security</p>
+          </div>
+        </div>
+      )}
+
+      {/* Header */}
+      <div className="mb-5">
+        <p className="k">{'// address'}{kind !== 'Address' && ` · ${kind.toLowerCase()}`}</p>
+        <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-2">
+          <h1 className="mr-1 min-w-0 break-words text-[clamp(26px,3.4vw,40px)] font-bold leading-[1.05] tracking-[-0.03em] text-ink">{headline}</h1>
+          {resolvedName && (
+            <Badge variant="default">
+              <span className="inline-flex items-center gap-1">
+                <Icon name="tag" className="h-3.5 w-3.5" />{resolvedName}
+              </span>
+            </Badge>
+          )}
+          {/* The headline already says "Contract …" when no label names the address. */}
+          {contractStatus.isContract && label && <Badge variant="default">Contract</Badge>}
+          <WatchlistButton address={addr} />
+          <a
+            href={`${chainConfig.externalExplorerUrl}/address/${addr}`}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="sm:ml-auto rounded-[9px] border border-hair px-2.5 py-1 font-mono text-xs text-ink2 transition-colors hover:border-hair3"
+          >
+            View on {chainConfig.externalExplorer} ↗
+          </a>
+        </div>
+        {/* The address is the page's key fact, so it is the largest thing in the header (and, with
+            the headline, the LCP candidate rather than the client-rendered ad card below: both are
+            server-rendered). */}
+        <div className="mt-2 flex items-start font-mono text-[17px] leading-snug text-ink sm:text-xl">
+          <span className="min-w-0 break-all pt-0.5">{checksummedAddr}</span>
+          <CopyButton text={checksummedAddr} referralPlacement="address_copy" />
+        </div>
+        {balanceKnown && (
+          <p className="mt-3 max-w-[60rem] text-[15px] leading-relaxed text-ink2">
+            Holds <span className="font-semibold text-ink">{groupDigits(formatNativeToken(displayBalance, 2))} {chainConfig.currency}</span>
+            {nativeUsd !== null && nativeUsd >= 0.1 ? ` (${formatCompactUsd(nativeUsd)})` : ''}
+            {trackedText && ` ${trackedText}`}
+            {txCountText !== '—' && <> across {txCountText} {displayTxCount === 1 ? 'transaction' : 'transactions'}</>}.
+          </p>
+        )}
+      </div>
+
+      {/* Fact strip */}
+      <dl className="ledger mb-6 md:[--cols:2] lg:[--cols:4]">
+        <Fact
+          wide
+          label={`${chainConfig.currency} Balance`}
+          value={balanceKnown ? `${groupDigits(formatNativeToken(displayBalance, 8))} ${chainConfig.currency}` : 'Unavailable'}
+          sub={nativeUsd ? `$${nativeUsd.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : undefined}
+        />
+        <Fact
+          label="Transactions"
+          value={txCountText}
+          sub={txDisplay.nonceNote ?? undefined}
+        />
+        <Fact
+          label="First indexed"
+          value={displayFirstSeen ? timeAgo(displayFirstSeen) : 'Unknown'}
+          sub={displayFirstSeen ? formatUtc(displayFirstSeen) : undefined}
+        />
+        <Fact
+          wide
+          label="Type"
+          value={kind}
+        />
+      </dl>
+
+      {/* Contract section */}
+      {contractStatus.isContract && (
+        <div className="mb-6 rounded-xl border border-hair bg-card p-4">
+          <h2 className="mb-3 font-semibold tracking-[-0.02em] text-ink">Contract</h2>
+          {contractResult?.verifiedAt ? (
+            <div>
+              <div className="flex items-center gap-2 mb-2">
+                <Badge variant="success">Verified</Badge>
+                <span className="text-sm text-mut">
+                  via {contractResult.verifySource} •{' '}
+                  {contractResult.compilerVersion ?? 'unknown'}
+                </span>
+              </div>
+              {contractResult.license && (
+                <p className="text-sm text-mut mb-2">
+                  License: {contractResult.license}
+                </p>
+              )}
+              {contractResult.sourceCode && (
+                <pre className="mt-3 max-h-64 overflow-auto rounded-lg border border-hair bg-canvas p-3 font-mono text-xs text-ink2">
+                  {contractResult.sourceCode.slice(0, 2000)}
+                  {contractResult.sourceCode.length > 2000
+                    ? '\n// ... truncated'
+                    : ''}
+                </pre>
+              )}
+              {contractResult.verifiedAt && contractResult.abi != null && (
+                <div className="mt-4">
+                  <h3 className="mb-2 text-sm font-medium text-ink">Read Contract</h3>
+                  <AbiReader address={addr} abi={contractResult.abi as unknown[]} />
+                </div>
+              )}
+            </div>
+          ) : (
+            <div className="flex items-center gap-3">
+              <Badge variant="pending">Unverified</Badge>
+              <Link href="/verify" className="text-sm text-acc-ink hover:underline">
+                Check on Sourcify →
+              </Link>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Tab bar */}
+      <div className="flex overflow-x-auto border-b border-hair mb-6 -mx-4 px-4 pr-6 max-sm:fade-r sm:mx-0 sm:px-0">
+        <TabLink
+          href={`/address/${addr}?tab=txns`}
+          active={activeTab === 'txns'}
+          label="Transactions"
+          count={`(${txCountText})`}
+        />
+        <TabLink
+          href={`/address/${addr}?tab=transfers`}
+          active={activeTab === 'transfers'}
+          label="Token Transfers"
+        />
+        <TabLink
+          href={`/address/${addr}?tab=holdings`}
+          active={activeTab === 'holdings'}
+          label="Holdings"
+        />
+        <TabLink
+          href={`/address/${addr}?tab=analytics`}
+          active={activeTab === 'analytics'}
+          label="Analytics"
+        />
+        <TabLink
+          href={`/address/${addr}?tab=nfts`}
+          active={activeTab === 'nfts'}
+          label="NFTs"
+        />
+      </div>
+
+      {/* Between the tab bar and the tab content, not after the content: the lazy tabs swap a ~210px
+          skeleton for a short message, and an ad below them would jump with it. */}
+      {gasReferralContext && (
+        <AdReserve
+          context={gasReferralContext}
+          placement={gasReferralContext === 'address_zero_balance' ? 'address_zero_balance' : 'address_low_balance'}
+          variant="compact"
+          className="mb-6"
+        />
+      )}
+
+      {/* Tab content */}
+      {activeTab === 'txns' && (
+        <TxnsTab addr={addr} page={page} total={displayTxCount} cursor={cursor} isBot={isBot} firstSeen={firstTxTimestamp} />
+      )}
+      {activeTab === 'transfers' && <TransfersTab addr={addr} page={page} isBot={isBot} firstSeen={firstTxTimestamp} />}
+      {activeTab === 'holdings' && <HoldingsTab addr={addr} isBot={isBot} nativeUsd={nativePrice} />}
+      {activeTab === 'analytics' && <AnalyticsTab addr={addr} addressInfo={addressInfo} />}
+      {activeTab === 'nfts' && <NftsTab addr={addr} isBot={isBot} />}
+    </div>
+  )
+}
+
+// ---- Transactions Tab ----
+
+async function TxnsTab({
+  addr,
+  page,
+  total,
+  cursor,
+  isBot,
+  firstSeen,
+}: {
+  addr: string
+  page: number
+  total: number
+  cursor?: string
+  isBot: boolean
+  firstSeen: Date | null
+}) {
+  const offset = (page - 1) * PAGE_SIZE
+  let txs: typeof schema.transactions.$inferSelect[] = []
+
+  try {
+    // Not `from = addr OR to = addr`: that form hits the statement timeout on busy addresses.
+    // The cast narrows the helper's both-tables row type to the table passed in.
+    txs = await selectByAddress(db, schema.transactions, addr, [], {
+      order: 'desc', limit: PAGE_SIZE, offset, tieBreak: schema.transactions.txIndex,
+    }) as typeof txs
+  } catch (e) {
+    swallow('addr/txns', e)
+    // DB error
+  }
+
+  // Serve the full Moralis history (TxnsLazy) when local can't show the complete picture:
+  //   - empty local index (page 1), OR
+  //   - retention-pruned wallet — `total` (addresses.tx_count) is the never-pruned lifetime
+  //     count, but the local transactions table holds only the last RETENTION_DAYS, so the
+  //     page-of-N pagination against `total` is bogus (e.g. heatherm.eth: 118 lifetime, 1
+  //     row retained, "Page 1 of 5"). isLocalHistoryIncomplete() detects this in O(1) via
+  //     first_seen < oldest-retained-block. This fires on ANY page so the bogus pagination
+  //     never renders. Fully-indexed active wallets (first_seen within the window) fall
+  //     through to the fast local table with no extra Moralis call.
+  // Either way the fetch is lazy on the client, so HTML scrapers (fake browser UAs, no JS)
+  // never trigger getWalletHistory during SSR — bots keep the local-index "not available" view.
+  const incomplete = isLocalHistoryIncomplete(firstSeen, await getRetentionFloor())
+  if (incomplete || (txs.length === 0 && page === 1)) {
+    if (isBot) {
+      return (
+        <div>
+          <p className="text-mut mb-2">Transaction history is not available in the local index for this address.</p>
+          {total > 0 && (
+            <p className="text-sm text-mut">
+              This address has {formatNumber(total)} transactions on-chain.{' '}
+              <a href={`${chainConfig.externalExplorerUrl}/address/${addr}`} target="_blank" rel="noopener noreferrer" className="text-acc-ink hover:underline">
+                View on {chainConfig.externalExplorer} ↗
+              </a>
+            </p>
+          )}
+        </div>
+      )
+    }
+    // A ledger needs 2 rows: exactly one known tx means none will draw, so no card is reserved.
+    return <TxnsLazy addr={addr} reserveLedger={total !== 1} />
+  }
+
+  return (
+    <div>
+      <div className="flex items-center justify-between mb-3">
+        <p className="font-mono text-[13px] text-mut">
+          Transactions ({formatNumber(total)})
+        </p>
+        <a
+          href={`/api/v1/addresses/${addr}/export`}
+          className="rounded-[9px] border border-hair px-2.5 py-1 font-mono text-xs text-acc-ink transition-colors hover:border-hair3 hover:underline"
+          download
+        >
+          ↓ Export CSV
+        </a>
+      </div>
+      <AddressLedger
+        rows={toLedgerRows(addr, txs.map(t => ({ time: t.timestamp, fromAddress: t.fromAddress, toAddress: t.toAddress, value: t.value, block: t.blockNumber, index: t.txIndex })))}
+        currency={chainConfig.currency}
+      />
+      <div className="bg-card rounded-xl border border-hair overflow-hidden mb-4">
+        <div className="overflow-x-auto">
+          <TxnsTable
+            caption={`${chainConfig.name} transactions for this address`}
+            currency={chainConfig.currency}
+            detailHeading="From / To"
+            rows={txs.map((tx) => {
+              const out = tx.fromAddress.toLowerCase() === addr
+              return {
+                hash: tx.hash,
+                timestamp: tx.timestamp,
+                value: tx.value,
+                detail: (
+                  <>
+                    <span className="text-mut text-xs">{out ? 'OUT' : 'IN'}{' '}</span>
+                    {out ? (
+                      tx.toAddress ? <AddressLink address={tx.toAddress} /> : <span className="text-mut">Contract Creation</span>
+                    ) : (
+                      <AddressLink address={tx.fromAddress} />
+                    )}
+                  </>
+                ),
+              }
+            })}
+          />
+        </div>
+      </div>
+      <Pagination
+        page={page}
+        total={Math.min(total, MAX_LIST_ROWS)}
+        perPage={PAGE_SIZE}
+        baseUrl={`/address/${addr}?tab=txns`}
+      />
+    </div>
+  )
+}
+
+// ---- Token Transfers Tab ----
+
+async function TransfersTab({ addr, page, isBot, firstSeen }: { addr: string; page: number; isBot: boolean; firstSeen: Date | null }) {
+  const offset = (page - 1) * PAGE_SIZE
+  let transfers: typeof schema.tokenTransfers.$inferSelect[] = []
+  let total = 0
+
+  try {
+    // Fetch one extra row to detect "has next page" — avoids COUNT(*) on token_transfers
+    // which is a full table scan with OR across two columns on millions of rows.
+    // (timestamp, block_number) order, which is block order: a block's timestamp never runs backwards.
+    const rows = await selectByAddress(db, schema.tokenTransfers, addr, [], { order: 'desc', limit: PAGE_SIZE + 1, offset }) as typeof transfers
+    transfers = rows.slice(0, PAGE_SIZE)
+    // Estimate total for pagination: if we got more than PAGE_SIZE, there are more pages
+    total = rows.length > PAGE_SIZE ? offset + PAGE_SIZE + 1 : offset + rows.length
+  } catch (e) {
+    swallow('addr/transfers', e)
+    // DB error
+  }
+
+  // Serve the full Moralis history (TransfersLazy) when local can't show the complete
+  // picture: empty local index (page 1), or a retention-pruned wallet whose first_seen
+  // predates the oldest retained block — token_transfers is pruned to the same rolling
+  // window as transactions, so the same O(1) signal applies. Fires on any page so the
+  // pagination is never bogus. Lazy on the client, so HTML scrapers never trigger Moralis
+  // during SSR; bots keep the local-index message. Fully-indexed active wallets fall
+  // through to the fast local table below with no extra Moralis call.
+  const incomplete = isLocalHistoryIncomplete(firstSeen, await getRetentionFloor())
+  if (incomplete || (transfers.length === 0 && page === 1)) {
+    if (isBot) {
+      return (
+        <p className="text-mut">
+          {transfers.length === 0
+            ? 'No token transfers found for this address.'
+            : 'Full token transfer history is not available in the local index for this address.'}
+        </p>
+      )
+    }
+    return <TransfersLazy addr={addr} />
+  }
+
+  // Look up token info (name/symbol/decimals) for DB transfers
+  const tokenInfoMap = new Map<string, TransferTokenInfo>()
+  if (transfers.length > 0) {
+    try {
+      const uniqueAddrs = [...new Set(transfers.map(t => t.tokenAddress))]
+      const tokenRows = await db.select({
+        address: schema.tokens.address,
+        name: schema.tokens.name,
+        symbol: schema.tokens.symbol,
+        decimals: schema.tokens.decimals,
+      }).from(schema.tokens).where(inArray(schema.tokens.address, uniqueAddrs))
+      for (const tok of tokenRows) {
+        tokenInfoMap.set(tok.address, { name: tok.name, symbol: tok.symbol, decimals: tok.decimals })
+      }
+    } catch (e) { swallow('addr/token-lookup', e) }  // token lookup error
+  }
+
+  return (
+    <div>
+      <div className="bg-card rounded-xl border border-hair overflow-hidden mb-4">
+        <div className="overflow-x-auto">
+        <table className="w-full text-sm">
+          <caption className="sr-only">{chainConfig.name} token transfers for this address</caption>
+          <thead className="bg-canvas border-b border-hair">
+            <tr>
+              <th scope="col" className={TH}>Tx Hash</th>
+              <th scope="col" className={TH}>Block</th>
+              <th scope="col" className={TH}>From</th>
+              <th scope="col" className={TH}>To</th>
+              <th scope="col" className={TH}>Token</th>
+              <th scope="col" className={TH}>Amount</th>
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-hair">
+            {transfers.map((t) => (
+              <TransferRow key={`${t.txHash}-${t.logIndex}`} t={t} addr={addr} info={tokenInfoMap.get(t.tokenAddress)} />
+            ))}
+          </tbody>
+        </table>
+        </div>
+      </div>
+      <Pagination
+        page={page}
+        total={Math.min(total, MAX_LIST_ROWS)}
+        perPage={PAGE_SIZE}
+        baseUrl={`/address/${addr}?tab=transfers`}
+      />
+    </div>
+  )
+}
+
+// ---- Analytics Tab ----
+
+async function AnalyticsTab({
+  addr,
+  addressInfo,
+}: {
+  addr: string
+  addressInfo: typeof schema.addresses.$inferSelect | null
+}) {
+  // null = the read failed, which renders "—": a DB error must not print as a confident zero.
+  let sent: FlowSample | null = null
+  let received: FlowSample | null = null
+  const firstSeen: Date | null = addressInfo?.firstSeen ? new Date(addressInfo.firstSeen) : null
+  const lastSeen: Date | null = addressInfo?.lastSeen ? new Date(addressInfo.lastSeen) : null
+
+  try {
+    // Use a capped sample (last 1000 successful txs) instead of full-table SUM scans.
+    // Full SUM on 36M+ row transactions table was the #1 cause of OOM crashes.
+    // Failed txs moved no value, so `status` keeps their `value` out of the sums; the labels
+    // (lib/address-analytics.ts) say these are samples of the index, not lifetime totals.
+    const cap = sql.raw(String(FLOW_SAMPLE_CAP))
+    const [sentResult, receivedResult] = await Promise.all([
+      db.execute(sql`
+        SELECT COALESCE(SUM(value::numeric), 0) as total, COUNT(*) as n
+        FROM (SELECT value FROM transactions WHERE from_address = ${addr} AND status = true ORDER BY timestamp DESC LIMIT ${cap}) sub
+      `),
+      db.execute(sql`
+        SELECT COALESCE(SUM(value::numeric), 0) as total, COUNT(*) as n
+        FROM (SELECT value FROM transactions WHERE to_address = ${addr} AND status = true ORDER BY timestamp DESC LIMIT ${cap}) sub
+      `),
+    ])
+
+    sent = parseFlowRow(Array.from(sentResult)[0])
+    received = parseFlowRow(Array.from(receivedResult)[0])
+
+    // first_seen/last_seen are pre-computed by the indexer in the addresses table.
+    // All 1.9M+ addresses have these fields populated, so no fallback needed.
+    // The previous fallback queried the 36M-row transactions table and took 30+ minutes.
+  } catch (e) {
+    swallow('addr/analytics', e)
+    // DB error
+  }
+
+  return (
+    <div className="bg-card rounded-xl border border-hair p-6">
+      <h2 className="mb-4 font-semibold tracking-[-0.02em] text-ink">Address Analytics</h2>
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-6">
+        <AnalyticItem label={flowLabel('Sent', sent)} value={flowValue(sent, chainConfig.currency)} />
+        <AnalyticItem label={flowLabel('Received', received)} value={flowValue(received, chainConfig.currency)} />
+        <AnalyticItem
+          label="First indexed"
+          value={firstSeen ? formatUtc(firstSeen) : 'Unknown'}
+        />
+        <AnalyticItem
+          label="Last Seen"
+          value={lastSeen ? formatUtc(lastSeen) : 'Unknown'}
+        />
+      </div>
+    </div>
+  )
+}
+
+// ---- NFTs Tab ----
+
+async function NftsTab({ addr, isBot }: { addr: string; isBot: boolean }) {
+  let nftTransfers: NftTransfer[] = []
+
+  try {
+    // One bounded walk per side of the NFT-only indexes; nftTransfersQuery says why not the OR form.
+    const result = await db.execute(nftTransfersQuery(addr, 50))
+    nftTransfers = Array.from(result).map(row => {
+      const r = row as Record<string, unknown>
+      return {
+        txHash: String(r.txHash ?? ''),
+        tokenAddress: String(r.tokenAddress ?? ''),
+        tokenId: r.tokenId ? String(r.tokenId) : null,
+        fromAddress: String(r.fromAddress ?? ''),
+        toAddress: String(r.toAddress ?? ''),
+        blockNumber: Number(r.blockNumber ?? 0),
+        name: r.name ? String(r.name) : undefined,
+        symbol: r.symbol ? String(r.symbol) : undefined,
+      }
+    })
+  } catch (e) { swallow('addr/nfts', e) }  // DB error
+
+  // Augment with Moralis NFT holdings when DB has no data — lazy on client so bots don't trigger it
+  if (nftTransfers.length === 0) {
+    if (isBot) {
+      return <p className="text-mut py-8 text-center">No NFT activity found for this address.</p>
+    }
+    return <NftsLazy addr={addr} />
+  }
+
+  return (
+    <div className="bg-card rounded-xl border border-hair overflow-hidden">
+      <div className="overflow-x-auto">
+      <table className="w-full text-sm">
+        <caption className="sr-only">{chainConfig.name} NFT transfer activity for this address</caption>
+        <thead className="bg-canvas border-b border-hair">
+          <tr>
+            <th scope="col" className={TH}>NFT</th>
+            <th scope="col" className={TH}>Token ID</th>
+            <th scope="col" className={TH}>Action</th>
+            <th scope="col" className={TH}>Tx Hash</th>
+            <th scope="col" className={TH}>Block</th>
+          </tr>
+        </thead>
+        <tbody className="divide-y divide-hair">
+          {nftTransfers.map((t, i) => (
+            <NftRow key={i} t={t} addr={addr} />
+          ))}
+        </tbody>
+      </table>
+      </div>
+    </div>
+  )
+}
+
+// ---- Sub-components ----
+
+function TabLink({
+  href,
+  active,
+  label,
+  count,
+}: {
+  href: string
+  active: boolean
+  label: string
+  count?: string
+}) {
+  return (
+    <Link
+      href={href}
+      className={`px-3 sm:px-4 py-2 text-sm font-medium border-b-2 transition-colors whitespace-nowrap ${
+        active
+          ? 'border-acc text-acc-ink'
+          : 'border-transparent text-ink2 hover:text-ink hover:border-hair3'
+      }`}
+    >
+      {label}
+      {count && <span className="ml-1 font-mono text-[13px] font-normal text-mut">{count}</span>}
+    </Link>
+  )
+}
+
+/**
+ * `wide` is for the balance: a figure that must not break mid-number, so it never wraps
+ * and, below lg where four cells are too narrow for it, takes a row of the two-column
+ * ledger to itself (Type shares that rule, so the grid has no empty cell).
+ */
+function Fact({ label, value, sub, wide }: { label: string; value: string; sub?: string; wide?: boolean }) {
+  return (
+    <div className={wide ? 'col-span-2 lg:col-span-1' : undefined}>
+      <dt className="k">{label}</dt>
+      <dd className={`mt-1 font-mono text-[15px] text-ink ${wide ? 'whitespace-nowrap' : 'break-words'}`}>{value}</dd>
+      {sub && <dd className="mt-0.5 break-words text-xs text-mut">{sub}</dd>}
+    </div>
+  )
+}
+
+function AnalyticItem({ label, value }: { label: string; value: string }) {
+  return (
+    <div>
+      <p className="k mb-1">{label}</p>
+      <p className="font-mono text-[15px] text-ink">{value}</p>
+    </div>
+  )
+}

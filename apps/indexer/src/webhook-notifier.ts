@@ -1,0 +1,397 @@
+/**
+ * Webhook notifier for the BNB chain indexer.
+ * Queries active webhooks from DB and delivers HMAC-signed payloads.
+ * Called by block-processor after each block is indexed.
+ */
+import { getChainConfig } from '@altscan/chain-config'
+import { getDb, schema, unwrapDbError } from './db'
+import { indexerConfig } from './config-instance'
+import { openSigningKey, parseWebhookSecretKey, sealSigningKey } from './webhook-secret'
+import { eq, or, and, inArray, isNull, isNotNull, sql } from 'drizzle-orm'
+import crypto from 'crypto'
+import dns from 'node:dns/promises'
+import net from 'node:net'
+
+type WebhookPayload = {
+  event: 'tx' | 'token_transfer' | 'new_block'
+  timestamp: string
+  blockNumber?: number
+  /** EIP-155 chain id. Both chains' webhooks sign and post identically, so a consumer registered on both needs this to tell them apart. */
+  chainId?: number
+  count?: number
+  // A single event object, or (for batched per-block tx delivery) an array.
+  data: Record<string, unknown> | Record<string, unknown>[]
+}
+
+/** True for IPv4/IPv6 loopback, private, link-local, ULA and CGNAT ranges. */
+function isPrivateIp(ip: string): boolean {
+  if (net.isIPv4(ip)) {
+    const [a, b] = ip.split('.').map(Number)
+    return (
+      a === 0 || a === 10 || a === 127 ||
+      (a === 192 && b === 168) ||
+      (a === 172 && b >= 16 && b <= 31) ||
+      (a === 169 && b === 254) ||   // link-local (incl. 169.254.169.254 metadata)
+      (a === 100 && b >= 64 && b <= 127) // CGNAT
+    )
+  }
+  const low = ip.toLowerCase().replace(/^::ffff:/, '')
+  if (net.isIPv4(low)) return isPrivateIp(low)
+  return low === '::1' || low.startsWith('fc') || low.startsWith('fd') || low.startsWith('fe80')
+}
+
+/**
+ * SSRF defense at delivery time. The registration-time host check only inspects
+ * the URL *string*; it cannot stop DNS rebinding (a hostname that resolved public
+ * at registration, re-pointed to an internal IP later). Two layers here:
+ *   1. Require https:// — an internal HTTP-only service (e.g. the cloud metadata
+ *      endpoint) cannot complete a public-CA TLS handshake for the registered host.
+ *   2. Resolve the hostname NOW and reject if any A/AAAA record is private/reserved.
+ * Redirect following is disabled separately (`redirect: 'error'`).
+ */
+async function isUrlSafe(url: string): Promise<boolean> {
+  let parsed: URL
+  try {
+    parsed = new URL(url)
+  } catch {
+    return false
+  }
+  if (parsed.protocol !== 'https:') return false
+  const hostname = parsed.hostname.toLowerCase()
+  const blockedHosts = /^(localhost|127\.|10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.|0\.0\.0\.0|169\.254\.|::1|fc00:|fe80:|0x|%)/
+  if (blockedHosts.test(hostname)) return false
+  if (/^\d+\.\d+\.\d+\.\d+$/.test(hostname) || hostname.includes(':')) return false
+  // Resolve and reject if the host currently points at a private/reserved IP.
+  try {
+    const addrs = await dns.lookup(hostname, { all: true })
+    if (addrs.length === 0) return false
+    if (addrs.some((a) => isPrivateIp(a.address))) return false
+  } catch {
+    return false
+  }
+  return true
+}
+
+async function deliverWebhook(url: string, secretHash: string, payload: WebhookPayload): Promise<boolean> {
+  // Re-validate URL at delivery time (DNS rebinding defense)
+  if (!(await isUrlSafe(url))) {
+    console.warn(`[webhook-notifier] Blocked delivery to unsafe URL: ${url}`)
+    return false
+  }
+
+  try {
+    const body = JSON.stringify(payload)
+    // secretHash is the SHA-256 of the original secret — we can't un-hash it for HMAC.
+    // Instead, use the secretHash directly as the HMAC key. Developers verify by computing
+    // HMAC-SHA256(payload, sha256(theirSecret)).
+    const sig = crypto.createHmac('sha256', secretHash).update(body).digest('hex')
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-BNBScan-Signature': `sha256=${sig}`,
+        'X-BNBScan-Event': payload.event,
+        'User-Agent': 'BNBScan-Webhook/1.0',
+      },
+      body,
+      signal: AbortSignal.timeout(10000),
+      // Prevent following redirects to internal URLs
+      redirect: 'error',
+    })
+    return res.ok
+  } catch {
+    return false
+  }
+}
+
+const WEBHOOK_FAIL_LIMIT = 5
+
+/**
+ * WEBHOOK_SECRET_KEY, parsed once (webhook-secret.ts). null = unset, or malformed:
+ * either way nothing is sealed, and sealed rows cannot be opened, so they are not
+ * delivered. A malformed key fails CLOSED for sealed rows rather than falling
+ * back to anything.
+ */
+let secretKey: Buffer | null | undefined
+export function webhookSecretKey(): Buffer | null {
+  if (secretKey === undefined) {
+    try {
+      secretKey = parseWebhookSecretKey(indexerConfig.webhooks.secretKey)
+    } catch (err) {
+      console.error(`[webhook-notifier] ${(err as Error).message} — signing keys will NOT be sealed, and sealed webhooks will not be delivered`)
+      secretKey = null
+    }
+  }
+  return secretKey
+}
+
+/** Webhooks already reported undeliverable, so a broken row logs once, not every block. */
+const reportedUnopenable = new Set<number>()
+
+/**
+ * The HMAC key for a webhook: its sealed key opened, else the legacy plaintext.
+ * null = cannot sign, so the webhook is skipped exactly as a row with no secret
+ * always was — before its delivery is claimed, and without counting a failure,
+ * because the endpoint did nothing wrong.
+ */
+function signingKeyFor(w: { id: number; secret: string | null; secretEnc: string | null }): string | null {
+  if (!w.secretEnc) return w.secret
+  const key = webhookSecretKey()
+  try {
+    if (!key) throw new Error('WEBHOOK_SECRET_KEY is unset or malformed')
+    return openSigningKey(w.secretEnc, key, w.id)
+  } catch (err) {
+    if (!reportedUnopenable.has(w.id)) {
+      reportedUnopenable.add(w.id)
+      console.error(`[webhook-notifier] cannot open the sealed signing key of webhook ${w.id} — not delivering it: ${(err as Error).message}`)
+    }
+    return null
+  }
+}
+
+/**
+ * Seal every plaintext signing key (webhook-secret.ts) and clear the plaintext.
+ *
+ * Idempotent, and guarded on the plaintext it read, so a row changed in between is
+ * left for the next pass rather than overwritten. Safe beside an older binary that
+ * still reads only `secret`: to it a cleared row has no secret, which it skips
+ * without counting a failure.
+ */
+export async function sealPlaintextWebhookSecrets(key: Buffer): Promise<number> {
+  const db = getDb()
+  const w = schema.webhooks
+  const rows = await db.select({ id: w.id, secret: w.secret }).from(w)
+    .where(and(isNotNull(w.secret), isNull(w.secretEnc))).orderBy(w.id).limit(500)
+  let sealed = 0
+  for (const row of rows) {
+    if (!row.secret) continue
+    const done = await db.update(w)
+      .set({ secretEnc: sealSigningKey(row.secret, key, row.id), secret: null })
+      .where(and(eq(w.id, row.id), eq(w.secret, row.secret), isNull(w.secretEnc)))
+      .returning({ id: w.id })
+    sealed += done.length
+  }
+  return sealed
+}
+
+/**
+ * notifyWebhooks is fired once per block without being awaited (block-processor),
+ * and a run waits on each delivery in turn, up to 10s apiece. Endpoints that
+ * answer slowly therefore stack one run per block, each holding its block's txs
+ * and a socket — without bound, since registering webhooks needs only a key any
+ * fresh wallet can mint. Past this many runs in flight, a block's notifications
+ * are skipped rather than grow the indexer's memory and socket count.
+ */
+export const MAX_INFLIGHT_NOTIFY_RUNS = 32
+let inflightRuns = 0
+let skippedRuns = 0
+
+/**
+ * Deliveries per block. A run POSTs one webhook at a time, up to 10 s each, so a block matching many webhooks held its
+ * run, and the runs behind it, for minutes; and registrations are cheap (69 at once on 2026-10-22, one target host).
+ * Past this many, a block delivers this many, starting at a cursor that advances by the cap each time a block is capped.
+ * The cursor moves with actual selections, not block height: webhooks due only on even blocks would otherwise always see
+ * the same start, and the same subset would always win. Every due webhook gets a turn within ceil(due / cap) capped runs.
+ */
+export const WEBHOOK_DELIVERIES_PER_BLOCK = 16
+let skippedDeliveries = 0
+let deliveryCursor = 0
+
+/** `due` in id order, capped at `cap`, starting at `cursor` (mod the count) and wrapping around. */
+export function pickDeliveries<T extends { id: number }>(due: readonly T[], cursor: number, cap: number): T[] {
+  if (due.length <= cap) return [...due]
+  const sorted = [...due].sort((a, b) => a.id - b.id)
+  const start = cursor % sorted.length
+  return Array.from({ length: cap }, (_, i) => sorted[(start + i) % sorted.length])
+}
+
+type NotifyTx = { hash: string; fromAddress: string; toAddress: string | null; value: string }
+
+/**
+ * Fire webhooks for all transactions in a newly indexed block.
+ * Matches webhooks against tx fromAddress / toAddress.
+ * Deactivates webhooks after WEBHOOK_FAIL_LIMIT consecutive failures.
+ */
+export async function notifyWebhooks(txs: NotifyTx[], blockNumber: number, timestamp: Date, blockHash: string) {
+  if (txs.length === 0) return
+  if (inflightRuns >= MAX_INFLIGHT_NOTIFY_RUNS) {
+    skippedRuns++
+    if (skippedRuns === 1 || skippedRuns % 100 === 0) {
+      console.warn(`[webhook-notifier] skipped block ${blockNumber}: ${MAX_INFLIGHT_NOTIFY_RUNS} runs still waiting on deliveries (${skippedRuns} skipped so far)`)
+    }
+    return
+  }
+  inflightRuns++
+  try {
+    await notifyBlock(txs, blockNumber, timestamp, blockHash)
+  } finally {
+    inflightRuns--
+  }
+}
+
+async function notifyBlock(txs: NotifyTx[], blockNumber: number, timestamp: Date, blockHash: string) {
+  const db = getDb()
+
+  // Collect all unique addresses in this block
+  const addresses = new Set<string>()
+  for (const tx of txs) {
+    addresses.add(tx.fromAddress)
+    if (tx.toAddress) addresses.add(tx.toAddress)
+  }
+  const addrList = [...addresses]
+
+  // Query active webhooks watching any of these addresses, or global (no watchAddress)
+  let webhooks: { id: number; url: string; secret: string | null; secretEnc: string | null; watchAddress: string | null; eventTypes: string[] }[]
+  try {
+    webhooks = await db.select({
+      id: schema.webhooks.id,
+      url: schema.webhooks.url,
+      secret: schema.webhooks.secret,
+      secretEnc: schema.webhooks.secretEnc,
+      watchAddress: schema.webhooks.watchAddress,
+      eventTypes: schema.webhooks.eventTypes,
+    }).from(schema.webhooks).where(
+      and(
+        eq(schema.webhooks.active, true),
+        or(
+          isNull(schema.webhooks.watchAddress),              // global webhooks (no address filter)
+          inArray(schema.webhooks.watchAddress, addrList),   // address-specific webhooks
+        ),
+      )
+    )
+  } catch (err) {
+    console.error('[webhook-notifier] DB query error:', unwrapDbError(err))
+    return
+  }
+
+  if (webhooks.length === 0) return
+
+  // Deliver all webhooks, then batch DB updates (instead of one UPDATE per tx per webhook)
+  const succeededIds = new Set<number>()
+  const failedIds = new Set<number>()
+
+  // The webhooks this block owes a POST, then at most WEBHOOK_DELIVERIES_PER_BLOCK of them, rotating.
+  const due = webhooks
+    .filter((w) => w.eventTypes.includes('tx'))
+    .map((w) => ({
+      id: w.id,
+      webhook: w,
+      signingKey: signingKeyFor(w),
+      // Filter: if watchAddress set, only deliver txs involving that address
+      relevantTxs: w.watchAddress
+        ? txs.filter(tx => tx.fromAddress === w.watchAddress || tx.toAddress === w.watchAddress)
+        : txs,
+    }))
+    .filter((d) => d.signingKey && d.relevantTxs.length > 0)
+  const picked = pickDeliveries(due, deliveryCursor, WEBHOOK_DELIVERIES_PER_BLOCK)
+  if (picked.length < due.length) {
+    deliveryCursor += WEBHOOK_DELIVERIES_PER_BLOCK
+    skippedDeliveries += due.length - picked.length
+    console.warn(`[webhook-notifier] block ${blockNumber}: ${due.length} webhooks due, delivered ${picked.length} (${skippedDeliveries} skipped so far)`)
+  }
+
+  for (const { webhook, relevantTxs, signingKey } of picked) {
+    if (!signingKey) continue
+
+    // ONE POST per webhook per block — batch all relevant txs into a single
+    // payload. Previously this sent one POST per tx, so a global webhook (no
+    // watchAddress) emitted hundreds of POSTs/block to an attacker-suppliable
+    // target URL — an amplification/DoS vector. Consumers now receive `data`
+    // as an array of tx objects for the block.
+    const payload: WebhookPayload = {
+      event: 'tx',
+      timestamp: timestamp.toISOString(),
+      blockNumber,
+      chainId: getChainConfig().chainId,
+      count: relevantTxs.length,
+      data: relevantTxs.map((tx) => ({
+        hash: tx.hash,
+        blockNumber,
+        from: tx.fromAddress,
+        to: tx.toAddress,
+        value: tx.value,
+      })),
+    }
+
+    // CLAIM before sending. Re-processing a block must not re-deliver its
+    // payload: a consumer that credits a balance or forwards an alert cannot
+    // distinguish the copy from the original, and unlike a duplicated DB row a
+    // sent POST can never be taken back. The primary key on
+    // (webhook_id, block_hash) IS the idempotency key — an INSERT that conflicts
+    // means this delivery already happened, so skip it.
+    //
+    // Keyed on the block HASH so a reorg still notifies: the replacement block at
+    // height N is a different block and a real event, which a number-keyed claim
+    // would have suppressed.
+    //
+    // Claiming BEFORE the POST is deliberate: a crash between send and record
+    // would otherwise re-send on replay, the exact failure being prevented. This
+    // is at-MOST-once, not at-least-once — the trade is explicit, since a
+    // duplicate side effect at the consumer cannot be undone and a missed one can
+    // be re-requested.
+    let claimed = false
+    try {
+      const res = await db.execute(sql`
+        INSERT INTO webhook_deliveries (webhook_id, block_hash, block_number)
+        VALUES (${webhook.id}, ${blockHash}, ${blockNumber})
+        ON CONFLICT (webhook_id, block_hash) WHERE block_hash IS NOT NULL DO NOTHING
+        RETURNING webhook_id
+      `)
+      claimed = Array.from(res as Iterable<unknown>).length > 0
+    } catch (err) {
+      // Ledger unreachable. FAIL CLOSED: skip the delivery rather than send
+      // unguarded. The guarantee this table exists to provide is at-most-once,
+      // and a claim we cannot record is a delivery we cannot bound — sending
+      // anyway would mean every writer hitting the same DB fault duplicates the
+      // same POST, which is precisely the failure being prevented. A missed
+      // notification is recoverable by the consumer; an unbounded duplicate that
+      // credits a balance twice is not.
+      console.error(`[webhook-notifier] delivery-ledger claim failed for webhook ${webhook.id} block ${blockNumber} — SKIPPING delivery:`, unwrapDbError(err))
+      continue
+    }
+    if (!claimed) continue
+
+    const ok = await deliverWebhook(webhook.url, signingKey, payload)
+    if (ok) {
+      succeededIds.add(webhook.id)
+    } else {
+      // The claim is deliberately KEPT.
+      //
+      // `ok === false` covers a timeout, a dropped connection and a 5xx alike,
+      // and in every one of those the receiver may already have processed the
+      // POST — the response is what went missing, not necessarily the request.
+      // Releasing the claim would re-send exactly those ambiguous cases on the
+      // next replay, so the release path would itself be a duplicate generator.
+      // At-most-once means an ambiguous outcome counts as delivered.
+      failedIds.add(webhook.id)
+    }
+  }
+
+  // Batch update succeeded webhooks
+  if (succeededIds.size > 0) {
+    try {
+      await db.update(schema.webhooks)
+        .set({ lastTriggeredAt: new Date(), failCount: 0 })
+        .where(inArray(schema.webhooks.id, [...succeededIds]))
+    } catch { /* non-fatal */ }
+  }
+
+  // Count failures IN SQL. The select above never loaded fail_count, so a count
+  // computed here was always 0 + 1 and the limit could not be reached; and runs
+  // overlap (one per block), so a read-modify-write would race anyway. `active`
+  // is ANDed, never recomputed, so a row another run deactivated stays off.
+  for (const id of failedIds) {
+    try {
+      const [row] = await db.update(schema.webhooks)
+        .set({
+          failCount: sql`${schema.webhooks.failCount} + 1`,
+          active: sql`${schema.webhooks.active} AND ${schema.webhooks.failCount} + 1 < ${WEBHOOK_FAIL_LIMIT}`,
+        })
+        .where(eq(schema.webhooks.id, id))
+        .returning({ failCount: schema.webhooks.failCount, active: schema.webhooks.active })
+      if (row && !row.active && row.failCount === WEBHOOK_FAIL_LIMIT) {
+        console.warn(`[webhook-notifier] Deactivated webhook ${id} after ${row.failCount} consecutive failures`)
+      }
+    } catch { /* non-fatal */ }
+  }
+}

@@ -1,0 +1,37 @@
+---
+import Base from '../layouts/Base.astro';
+import Nav from '../components/Nav.astro';
+import Hero from '../components/Hero.astro';
+import Tapes from '../components/Tapes.astro';
+import Anatomy from '../components/Anatomy.astro';
+import ProductCard from '../components/ProductCard.astro';
+import OpenSource from '../components/OpenSource.astro';
+import Footer from '../components/Footer.astro';
+import { products } from '../data/products';
+import { GITHUB } from '../data/site';
+---
+<Base>
+  <Nav />
+  <main>
+    <Hero />
+    <Tapes />
+    <Anatomy />
+
+    <section id="explorers" class="wrap sec rule" aria-labelledby="explorers-title">
+      <p class="k">// two explorers, live today</p>
+      <h2 id="explorers-title">Same engine.<br />Each on its own domain.</h2>
+      <div class="prods">
+        {products.map((p) => <ProductCard product={p} />)}
+      </div>
+      <p class="more">More chains are on the way, and each is announced on GitHub first.<a href={GITHUB}>Watch the repo ↗</a></p>
+    </section>
+
+    <OpenSource />
+  </main>
+  <Footer />
+</Base>
+
+<script>
+  import '../scripts/webmcp';
+  import '../scripts/tapes';
+</script>

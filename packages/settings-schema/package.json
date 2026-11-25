@@ -1,0 +1,18 @@
+{
+  "name": "@altscan/settings-schema",
+  "license": "AGPL-3.0-only",
+  "version": "0.0.1",
+  "main": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.0"
+  }
+}

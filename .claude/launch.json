@@ -1,0 +1,65 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "altscan-site",
+      "runtimeExecutable": "pnpm",
+      "runtimeArgs": ["--filter", "@altscan/site", "dev"],
+      "port": 4321
+    },
+    {
+      "name": "BNBScan Web (Next.js)",
+      "runtimeExecutable": "pnpm",
+      "runtimeArgs": ["--filter", "@altscan/explorer", "dev"],
+      "port": 3000,
+      "autoPort": false,
+      "env": {
+        "CHAIN": "bnb",
+        "NEXT_PUBLIC_CHAIN": "bnb"
+      }
+    },
+    {
+      "name": "BNBScan Indexer (Worker)",
+      "runtimeExecutable": "pnpm",
+      "runtimeArgs": ["--filter", "@altscan/indexer", "dev"],
+      "port": 0
+    },
+    {
+      "name": "Explorer BNB (Next.js)",
+      "runtimeExecutable": "pnpm",
+      "runtimeArgs": ["--filter", "@altscan/explorer", "exec", "next", "dev", "-p", "3002"],
+      "port": 3002,
+      "env": {
+        "CHAIN": "bnb",
+        "NEXT_PUBLIC_CHAIN": "bnb",
+        "BNB_RPC_URL": "https://bsc-dataseed.bnbchain.org"
+      }
+    },
+    {
+      "name": "Explorer ETH (Next.js)",
+      "runtimeExecutable": "pnpm",
+      "runtimeArgs": ["--filter", "@altscan/explorer", "exec", "next", "dev", "-p", "3003"],
+      "port": 3003,
+      "env": {
+        "CHAIN": "eth",
+        "NEXT_PUBLIC_CHAIN": "eth",
+        "ETH_RPC_URL": "https://ethereum-rpc.publicnode.com"
+      }
+    },
+    {
+      "name": "All (Turbo)",
+      "runtimeExecutable": "pnpm",
+      "runtimeArgs": ["dev"],
+      "port": 3000
+    },
+    {
+      "name": "Status Page",
+      "runtimeExecutable": "npx",
+      "runtimeArgs": ["tsx", "apps/status/src/server.ts"],
+      "port": 3090,
+      "env": {
+        "ADMIN_SECRET": "${ADMIN_SECRET}"
+      }
+    }
+  ]
+}

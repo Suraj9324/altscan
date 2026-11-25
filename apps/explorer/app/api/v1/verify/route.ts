@@ -1,0 +1,80 @@
+import { NextResponse } from 'next/server'
+import { db, schema } from '@/lib/db'
+import { checkRateLimit, clientIpBucket } from '@/lib/api-rate-limit'
+import { triggerSourcifyVerification } from '@/lib/verifier'
+import { chainConfig } from '@/lib/chain'
+
+const ADDRESS_REGEX = /^0x[0-9a-fA-F]{40}$/
+
+export async function POST(request: Request) {
+  // Tighter rate limit for write operations — 10 per minute per IP. Own `verify:`
+  // bucket (Redis `rl:verify:<ip>`): the bare `<ip>` bucket is the 100/min budget
+  // every other route increments, so sharing it let 11 ordinary calls 429 a verify.
+  if (!(await checkRateLimit(`verify:${clientIpBucket(request.headers)}`, 10))) {
+    return NextResponse.json({ error: 'Rate limit exceeded' }, { status: 429 })
+  }
+
+  // Origin check — verify request comes from our domains (CSRF protection)
+  const origin = request.headers.get('origin') ?? ''
+  const referer = request.headers.get('referer') ?? ''
+  const ALLOWED_ORIGINS = [`https://${chainConfig.domain}`, `https://www.${chainConfig.domain}`]
+  if (process.env.NODE_ENV === 'development') ALLOWED_ORIGINS.push('http://localhost:3000', 'http://localhost:3001')
+  const originAllowed = ALLOWED_ORIGINS.some(o => origin === o)
+  const refererAllowed = ALLOWED_ORIGINS.some(o => referer.startsWith(o + '/') || referer === o)
+  if (!originAllowed && !refererAllowed) {
+    return NextResponse.json({ error: 'Invalid request origin' }, { status: 403 })
+  }
+
+  let body: { address?: string }
+  try {
+    body = await request.json()
+  } catch {
+    return NextResponse.json({ error: 'Invalid JSON body' }, { status: 400 })
+  }
+
+  // The body may still carry `compilerVersion` (older clients and the /verify form send one),
+  // but it is deliberately never read: this route persists whatever Sourcify reports for the
+  // contract, so a caller cannot stamp an arbitrary compiler string onto a verified contract.
+  const { address } = body
+
+  if (!address || !ADDRESS_REGEX.test(address)) {
+    return NextResponse.json({ error: 'Invalid address' }, { status: 400 })
+  }
+
+  const result = await triggerSourcifyVerification(address, chainConfig)
+
+  if (result.success) {
+    try {
+      await db
+        .insert(schema.contracts)
+        .values({
+          // ⚠ MUST be lowercased. contracts.address is the primary key and every
+          // reader looks it up lowercased, but ADDRESS_REGEX accepts checksummed
+          // input — so persisting the caller's casing wrote a row nothing could
+          // find, and the address page showed a verified contract as Unverified.
+          address: address.toLowerCase(),
+          bytecode: '0x',
+          verifySource: 'sourcify',
+          compilerVersion: result.compilerVersion ?? null,
+          verifiedAt: new Date(),
+        })
+        .onConflictDoUpdate({
+          target: schema.contracts.address,
+          set: {
+            verifySource: 'sourcify',
+            compilerVersion: result.compilerVersion ?? null,
+            verifiedAt: new Date(),
+          },
+        })
+    } catch {
+      return NextResponse.json(
+        { success: true, match: 'sourcify', warning: 'Verified but failed to save to local DB' },
+        { status: 200 },
+      )
+    }
+
+    return NextResponse.json({ success: true, match: 'sourcify' }, { status: 200 })
+  }
+
+  return NextResponse.json({ success: false, error: result.error }, { status: 422 })
+}

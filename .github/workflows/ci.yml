@@ -1,0 +1,286 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Cancel superseded runs on the same ref to save runner minutes.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# Nothing here writes to the repo. Say so explicitly rather than inheriting
+# whatever the repository default happens to be.
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    # Throwaway Postgres for the PG-gated suites (fence/atomicity proofs the
+    # string-pin tests cannot express). Two databases because the explorer seam
+    # suite and the indexer worker suite share BACKFILL_TEST_PG_URL but clash
+    # on table names — they run as separate steps against separate DBs.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: x
+          POSTGRES_DB: worker_test
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      # Throwaway Redis for the budget suite. That suite runs the REAL admission
+      # Lua against a REAL server — a JS re-implementation would only test the
+      # re-implementation — and without this it reports "12 tests | 12 skipped"
+      # in CI, which is how the Moralis CU ceiling reached production with no
+      # coverage of the one failure that actually took it down.
+      redis:
+        image: redis:7
+        ports: ['6379:6379']
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    # Actions are pinned to commit SHAs (a tag can be moved to new code); the
+    # trailing comment is the release that SHA is. Dependabot keeps them fresh.
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+
+      # Node 22 is what the Docker images and the Render services run; test on it.
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Run tests
+        run: pnpm test
+
+      # The indexer's deploy build deliberately swallows tsc failures
+      # ("tsc || true") and workspace packages ship TS source, so type errors
+      # in the indexer program surface nowhere else. strictNullChecks (A4b-2)
+      # is load-bearing for ProviderResult narrowing — enforce it here.
+      # @altscan/db, @altscan/chain-config, @altscan/explorer-core and
+      # @altscan/providers are the BUILT workspace packages (main -> dist/,
+      # which is gitignored): vitest aliases them to source, but bare tsc
+      # resolves package types from dist — build them first. Order matters:
+      # providers' emit type-checks its value-import of the explorer-core
+      # barrel, so explorer-core must be built before it; providers also
+      # type-imports chain-config, so chain-config precedes both.
+      - name: Typecheck indexer
+        run: pnpm --filter @altscan/db build && pnpm --filter @altscan/chain-config build && pnpm --filter @altscan/explorer-core build && pnpm --filter @altscan/providers build && pnpm --filter @altscan/indexer exec tsc --noEmit
+
+      # The admin console's deploy (astro build) never runs tsc, so its type
+      # errors surfaced nowhere until #181 cleared them. No build or astro sync
+      # first: the tsconfig maps chain-config to source and includes only src/,
+      # not .astro/. Covers .ts/.tsx only — .astro files would need astro check.
+      - name: Typecheck admin
+        run: pnpm --filter @altscan/admin exec tsc --noEmit -p .
+
+      # The OAuth server package ships as TS source. altscan.io's deploy never
+      # typechecks it, so this is the only gate on the altscan.io side.
+      - name: Typecheck oauth
+        run: pnpm --filter @altscan/oauth exec tsc --noEmit -p .
+
+      - name: Create seam-test database
+        run: PGPASSWORD=x psql -h 127.0.0.1 -U postgres -d worker_test -c 'CREATE DATABASE seam_test'
+
+      # The sizes suite isolates itself in its own schema, so it can share the
+      # worker database.
+      - name: PG-gated indexer suites (worker fence/atomicity + partition sizes)
+        env:
+          BACKFILL_TEST_PG_URL: postgres://postgres:x@127.0.0.1:5432/worker_test
+          SIZES_TEST_PG_URL: postgres://postgres:x@127.0.0.1:5432/worker_test
+        run: npx vitest run apps/indexer/src/backfill-worker.pg.test.ts apps/indexer/src/retention-sizes.pg.test.ts
+
+      - name: PG-gated explorer suite (O1 seam)
+        env:
+          BACKFILL_TEST_PG_URL: postgres://postgres:x@127.0.0.1:5432/seam_test
+        run: npx vitest run apps/explorer/lib/backfill-serve.pg.test.ts
+
+      # The token page's transfer list: token_address = $1 ORDER BY block_number
+      # walked the whole table for a token that had gone quiet and hit the web
+      # statement_timeout. Asserts rows read, on both the BNB (partitioned) and ETH
+      # (plain) shapes. Its tables are TEMP, so it shares worker_test.
+      - name: PG-gated explorer suite (token page transfers)
+        env:
+          TOKEN_TRANSFERS_TEST_PG_URL: postgres://postgres:x@127.0.0.1:5432/worker_test
+        run: npx vitest run apps/explorer/lib/token-transfers-query.pg.test.ts
+
+      # getDb() itself: a query that fails after rows have streamed must not leave
+      # holes in the next result on that connection (postgres.js row-counter bug,
+      # patches/postgres@3.4.8.patch). Its table is TEMP, so it shares worker_test.
+      - name: PG-gated db client suite (postgres.js row-counter patch)
+        env:
+          DB_CLIENT_TEST_PG_URL: postgres://postgres:x@127.0.0.1:5432/worker_test
+        run: npx vitest run packages/db/client.pg.test.ts
+
+      # The token-metadata healer's head + keyset SQL: the walk is one ORDER BY with no
+      # skip or repeat across thousands of rows tied on holder_count, and Postgres can
+      # prove the healer's parameterised WHERE implies the partial index (a failed proof
+      # is a silent fallback to a sorted walk of tokens_holder_count_idx, not an error).
+      # Everything lives in its own schema, so it shares worker_test.
+      - name: PG-gated indexer suite (token healer keyset + partial index)
+        env:
+          TOKEN_HEAL_TEST_PG_URL: postgres://postgres:x@127.0.0.1:5432/worker_test
+        run: npx vitest run apps/indexer/src/token-heal.pg.test.ts
+
+      # Webhook failure accounting through the shipped notifyWebhooks: five consecutive
+      # failures deactivate, a success resets, and a failure after a concurrent
+      # deactivation does not revive the row. Own schema, so it shares worker_test.
+      - name: PG-gated indexer suite (webhook failure accounting)
+        env:
+          WEBHOOK_TEST_PG_URL: postgres://postgres:x@127.0.0.1:5432/worker_test
+        run: npx vitest run apps/indexer/src/webhook-notifier.pg.test.ts
+
+      # The round-5 production indexes: tokens' lower() text_pattern_ops pair and the
+      # combined token_transfers whale partial index (tt_whale_idx), on BNB's partitioned
+      # shape and ETH's plain one. It proves the parent turns valid, a partition made by
+      # the real creator inherits the index, the steady-state boot issues no DDL, every
+      # token's value-ordered query uses it, and the boot sweep leaves an index build in
+      # flight alone. It creates and drops token_transfers/tokens in public and its
+      # catalog helpers match relations by name across schemas, so it gets a database of
+      # its own.
+      - name: Create whale-index-test database
+        run: PGPASSWORD=x psql -h 127.0.0.1 -U postgres -d worker_test -c 'CREATE DATABASE whale_idx_test'
+
+      - name: PG-gated indexer suite (tokens + token_transfers whale indexes)
+        env:
+          TT_WHALE_INDEX_TEST_PG_URL: postgres://postgres:x@127.0.0.1:5432/whale_idx_test
+        run: npx vitest run apps/indexer/src/tt-whale-index.pg.test.ts
+
+      # A MAX_LAG skip lands only where token_transfers already has partitions: a skip past the
+      # last bound is covered first, a ladder whose partitions retention dropped is re-seeded at the
+      # cursor, and a lock timeout or a name CREATE TABLE IF NOT EXISTS skips is caught by reading the
+      # catalog back. It creates and drops token_transfers and blocks in public, so it gets a
+      # database of its own.
+      - name: Create partition-coverage-test database
+        run: PGPASSWORD=x psql -h 127.0.0.1 -U postgres -d worker_test -c 'CREATE DATABASE partition_cov_test'
+
+      - name: PG-gated indexer suite (token_transfers partitions cover a MAX_LAG skip)
+        env:
+          PARTITION_COVERAGE_TEST_PG_URL: postgres://postgres:x@127.0.0.1:5432/partition_cov_test
+        run: npx vitest run apps/indexer/src/partition-coverage.pg.test.ts
+
+      # One block whose own rows fail no longer stalls the transfer writer: the blocks around it
+      # commit, W stays below it, a repeating data error becomes a 1-block index gap and only then
+      # lets W pass, and a missing partition, an unknown SQLSTATE or a failed W persist never moves
+      # W. Real SQLSTATEs, so a real server. It creates and drops token_transfers, blocks,
+      # index_gaps and indexer_cursor in public, so it gets a database of its own.
+      - name: Create tt-isolation-test database
+        run: PGPASSWORD=x psql -h 127.0.0.1 -U postgres -d worker_test -c 'CREATE DATABASE tt_isolation_test'
+
+      - name: PG-gated indexer suite (transfer writer isolates a failing block)
+        env:
+          TT_WRITER_ISOLATION_TEST_PG_URL: postgres://postgres:x@127.0.0.1:5432/tt_isolation_test
+        run: npx vitest run apps/indexer/src/tt-writer-isolation.pg.test.ts
+
+      # POST /api/v1/query's filter.address: an OR across from/to ordered by
+      # block_number walked the whole table and hit the web statement_timeout
+      # ~95x/hour on BNB. Asserts rows read, not wall time. Its tables are TEMP,
+      # so it shares worker_test.
+      - name: PG-gated explorer suite (api/v1/query address filter)
+        env:
+          ADDRESS_QUERY_TEST_PG_URL: postgres://postgres:x@127.0.0.1:5432/worker_test
+        run: npx vitest run apps/explorer/lib/address-query.pg.test.ts
+
+      # The header typeahead's prefix LIKE and /search's exact-match lookup: both are served by
+      # text_pattern_ops expression indexes, and a plan that stops using them silently seq-scans a
+      # multi-million-row table. Asserts the plan (and that the driver runs them unprepared, which is what
+      # lets a bound LIKE use the index). Its table is TEMP, so it shares worker_test.
+      - name: PG-gated explorer suite (token typeahead + exact-match index plans)
+        env:
+          TOKEN_SUGGEST_TEST_PG_URL: postgres://postgres:x@127.0.0.1:5432/worker_test
+        run: npx vitest run apps/explorer/lib/token-suggest.pg.test.ts
+      # /whales' token candidates: each tracked token's largest whale-size transfers must be served by the
+      # combined tt_whale_idx (BNB's partitioned shape and ETH's plain one, under a generic plan too), a
+      # $1M transfer older than the newest 25 must outrank recent small ones, and a transfer that qualifies
+      # for both arms must come out once. Its tables are TEMP, so it shares worker_test.
+      - name: PG-gated explorer suite (whales token candidates)
+        env:
+          WHALES_TEST_PG_URL: postgres://postgres:x@127.0.0.1:5432/worker_test
+        run: npx vitest run apps/explorer/lib/whales.pg.test.ts
+
+      # /gas' tiers: percentile_disc over the transactions of the newest 20 blocks. Asserts the values
+      # (window, zero-price and negative-tip rules) and that the plan is the 20-row primary-key walk plus
+      # tx_block_idx, not a table scan. Its tables are TEMP, so it shares worker_test.
+      - name: PG-gated explorer suite (/gas percentile tiers)
+        env:
+          GAS_TIERS_TEST_PG_URL: postgres://postgres:x@127.0.0.1:5432/worker_test
+        run: npx vitest run apps/explorer/lib/gas-percentiles.pg.test.ts
+
+      # API key minting: the existing-key check, the 10-key cap and the insert run under one per-owner
+      # advisory lock. 15 parallel requests on a 15-connection pool must mint exactly one first key on a
+      # signature alone, and never take an address past the cap. It creates and drops api_keys, and its
+      # requests use separate pooled connections, so it gets a database of its own.
+      - name: Create key-mint-test database
+        run: PGPASSWORD=x psql -h 127.0.0.1 -U postgres -d worker_test -c 'CREATE DATABASE key_mint_test'
+
+      - name: PG-gated explorer suite (API key minting under concurrency)
+        env:
+          API_KEY_MINT_TEST_PG_URL: postgres://postgres:x@127.0.0.1:5432/key_mint_test
+        run: npx vitest run apps/explorer/lib/api-key-mint.pg.test.ts
+
+      # Wallet watch: concurrent adds need pooled connections, and it creates blocks/transactions,
+      # so it gets a database of its own.
+      - name: Create watch-events-test database
+        run: PGPASSWORD=x psql -h 127.0.0.1 -U postgres -d worker_test -c 'CREATE DATABASE watch_events_test'
+
+      - name: PG-gated explorer suite (wallet watch)
+        env:
+          WATCH_EVENTS_TEST_PG_URL: postgres://postgres:x@127.0.0.1:5432/watch_events_test
+        run: npx vitest run apps/explorer/lib/watch-events.pg.test.ts
+
+      # Gated on its own var like the PG suites above. It CONFIG SETs maxmemory
+      # on the server to reproduce a full noeviction instance, so it needs the
+      # throwaway service and must never be pointed at a shared Redis.
+      - name: Redis-gated provider suite (Moralis CU admission + ledger)
+        env:
+          MORALIS_TEST_REDIS_URL: redis://127.0.0.1:6379
+        run: npx vitest run packages/providers/src/moralis-cu-budget.redis.test.ts
+
+      # The explorer's OAuth authorization codes are single-use through a Lua get-and-delete;
+      # only a real Redis can show that (and the TTL) holds. Writes only short-TTL oauth:code:* keys.
+      - name: Redis-gated explorer suite (OAuth codes)
+        env:
+          OAUTH_TEST_REDIS_URL: redis://127.0.0.1:6379
+        run: npx vitest run apps/explorer/lib/oauth-codes.redis.test.ts
+
+      # `pnpm lint` was dead for the life of the repo: apps/explorer's script was
+      # `next lint` with no ESLint config anywhere, so it dropped into an
+      # interactive setup prompt and exited 1, and CI never ran it. ESLint is now
+      # a real dependency with a flat config, and this step keeps it that way.
+      # Warnings do not fail the build; errors do.
+      - name: Lint
+        run: pnpm lint
+
+      # Nothing else here builds the explorer — only Render does — so a class of
+      # failure reaches production having passed every gate. Twice now: a stale
+      # `transpilePackages` entry (#118) and `export const revalidate =
+      # <imported identifier>`, which Next's static route-config analysis rejects
+      # at BUILD time while typecheck and every test pass (#117 -> #120).
+      # A dummy DATABASE_URL is enough: the pages catch their own DB errors, and
+      # what is being gated is compilation and segment config, not data.
+      - name: Build explorer (segment config + transpilePackages gate)
+        env:
+          DATABASE_URL: postgres://postgres:x@127.0.0.1:5432/worker_test
+        run: pnpm --filter @altscan/explorer build
+
+      # apps/altscan-site ships its own tsx harness (excluded from the root
+      # vitest run); run it here so its chain-payload tests still gate PRs.
+      - name: Run altscan-site tests
+        run: pnpm --filter @altscan/site test

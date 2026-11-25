@@ -1,0 +1,52 @@
+---
+name: altscan-api
+description: "Query BNB Chain or Ethereum data through Altscan's free explorers: pick bnbscan.com or ethscan.io by chain, then call the same keyless REST API on either (blocks, transactions, addresses, tokens, contracts)."
+---
+
+# Altscan explorers — which one, and how to query it
+
+Altscan is one open-source explorer engine running a separate explorer per chain. Each explorer serves
+the same public REST API, so code written for one works on the other with a different base URL.
+
+## Pick the explorer by chain
+
+| Chain | chainId | Explorer | API base |
+|---|---|---|---|
+| BNB Chain | 56 | https://bnbscan.com | https://bnbscan.com/api/v1 |
+| Ethereum | 1 | https://ethscan.io | https://ethscan.io/api/v1 |
+
+There is no Altscan explorer for other chains. Do not send an address or hash for one chain to the
+other chain's explorer: the API returns "not found" rather than an error that names the chain.
+
+## Calling the API
+
+- No API key, no auth. Rate limits are per client IP; on HTTP 429, back off and retry later.
+- Every response is JSON. Common starting points:
+  - `GET /api/v1/stats` — latest block, transaction and token counts, average gas price
+  - `GET /api/v1/transactions/{hash}` — one transaction, with its status and gas used (no logs)
+  - `GET /api/v1/addresses/{address}` — the address's 20 latest indexed transactions and token transfers,
+    and `isContract`; when `isContractKnown` is false the contract check failed and `isContract` means nothing.
+    It also returns live `nativeBalance` (wei) and `trackedTokenBalances` (major stablecoins and the wrapped
+    native token only); null means the read failed, not an empty wallet
+  - `GET /api/v1/tokens/{contract}` — token metadata
+- The read endpoints, kept in step with the code, are described in each explorer's OpenAPI 3.1 spec at
+  `/openapi.json` (every parameter and response field, e.g. https://bnbscan.com/openapi.json), its own
+  skill at `/.well-known/agent-skills/api-usage/SKILL.md` and its RFC 9727 catalog at
+  `/.well-known/api-catalog`. Human docs at `/api-docs` also cover the write endpoints.
+
+## Limits to know
+
+- Indexed history is recent: an address's transaction list covers only the last few days (from its
+  `indexedFrom`). `historyComplete: false` means the address has older activity outside the index, so
+  empty lists do not mean no activity; `null` means it cannot be told.
+- A transaction older than that is read from the chain instead. The response's `source` is `"index"`
+  or `"chain"`; `pending: true` means no receipt yet, and fields the node did not report are null.
+  A 404 means neither the index nor the node knows the hash; a 503 means the chain lookup is busy or
+  failed, so retry later.
+- Token holder counts are an indexed snapshot, labelled "indexed holders" on the sites, and are lower
+  than the true holder count.
+
+## Live status
+
+`https://altscan.io/api/chains.json` returns each explorer's latest indexed block and its recent blocks,
+cached for 12 seconds. Use it to check that an explorer is current before trusting a "latest" answer.

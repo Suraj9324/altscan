@@ -1,0 +1,176 @@
+import { serve } from '@hono/node-server'
+import { Hono } from 'hono'
+import { secureHeaders } from 'hono/secure-headers'
+import { html } from './page.js'
+import { classifyHealth } from './classify.js'
+
+// ── Config ──────────────────────────────────────────────────────────
+const PORT = Number(process.env.PORT) || 3090
+const POLL_INTERVAL = 30_000 // 30s
+const HISTORY_HOURS = 24
+const MAX_HISTORY = (HISTORY_HOURS * 3600_000) / POLL_INTERVAL // ~2880 entries
+
+interface ServiceHealth {
+  name: string
+  url: string
+  healthUrl: string
+  status: 'operational' | 'degraded' | 'down' | 'unknown'
+  latestBlock: number | null
+  lagSeconds: number | null
+  responseTimeMs: number | null
+  lastChecked: string | null
+  error: string | null
+}
+
+interface HistoryEntry {
+  ts: number
+  status: 'operational' | 'degraded' | 'down'
+  responseTimeMs: number | null
+  lagSeconds: number | null
+}
+
+interface DailySummary {
+  date: string
+  total: number
+  operational: number
+  degraded: number
+  down: number
+}
+
+// ── State ───────────────────────────────────────────────────────────
+const services: Record<string, ServiceHealth> = {
+  ethscan: {
+    name: 'ethscan.io',
+    url: 'https://ethscan.io',
+    healthUrl: 'https://ethscan.io/api/health',
+    status: 'unknown',
+    latestBlock: null, lagSeconds: null, responseTimeMs: null,
+    lastChecked: null, error: null,
+  },
+  bnbscan: {
+    name: 'bnbscan.com',
+    url: 'https://bnbscan.com',
+    healthUrl: 'https://bnbscan.com/api/health',
+    status: 'unknown',
+    latestBlock: null, lagSeconds: null, responseTimeMs: null,
+    lastChecked: null, error: null,
+  },
+}
+
+const history: Record<string, HistoryEntry[]> = {
+  ethscan: [],
+  bnbscan: [],
+}
+
+const dailyHistory: Record<string, DailySummary[]> = {
+  ethscan: [],
+  bnbscan: [],
+}
+
+// ── Polling ─────────────────────────────────────────────────────────
+async function checkService(key: string) {
+  const svc = services[key]
+  const start = Date.now()
+  try {
+    const controller = new AbortController()
+    const timeout = setTimeout(() => controller.abort(), 10_000)
+    // Public status page: consume ONLY the unauthenticated /api/health view
+    // (status/latestBlock/lagSeconds). Do NOT send ADMIN_SECRET here — this
+    // page and its /api/status JSON are public, and forwarding the secret
+    // pulled admin-only internals (DB conns/size, heap) into a public surface.
+    const res = await fetch(svc.healthUrl, { signal: controller.signal })
+    clearTimeout(timeout)
+    const elapsed = Date.now() - start
+
+    const contentType = res.headers.get('content-type') || ''
+    if (!contentType.includes('json')) {
+      // DDoS protection page or non-JSON — treat as degraded but reachable
+      svc.status = 'degraded'
+      svc.responseTimeMs = elapsed
+      svc.error = 'Non-JSON response (DDoS protection)'
+      svc.lastChecked = new Date().toISOString()
+      pushHistory(key, 'degraded', elapsed, svc.lagSeconds)
+      return
+    }
+
+    const data = await res.json() as Record<string, unknown>
+    svc.responseTimeMs = elapsed
+    svc.lastChecked = new Date().toISOString()
+    svc.error = null
+
+    // Degraded: upstream says so (critical memory pressure, abandoned blocks, an unreadable blocks
+    // table), the payload lacks a head or its lag, or the head is stale (> 2 min) — see classifyHealth.
+    const result = classifyHealth(data)
+    svc.latestBlock = result.latestBlock
+    svc.lagSeconds = result.lagSeconds
+    svc.status = result.status
+    pushHistory(key, svc.status === 'operational' ? 'operational' : 'degraded', elapsed, svc.lagSeconds)
+  } catch (err) {
+    const elapsed = Date.now() - start
+    svc.status = 'down'
+    // The last good head/lag would otherwise keep rendering beside a "down" badge.
+    svc.latestBlock = null
+    svc.lagSeconds = null
+    svc.responseTimeMs = elapsed
+    svc.error = err instanceof Error ? err.message : 'Unknown error'
+    svc.lastChecked = new Date().toISOString()
+    pushHistory(key, 'down', null, null)
+  }
+}
+
+function pushHistory(key: string, status: HistoryEntry['status'], responseTimeMs: number | null, lagSeconds: number | null) {
+  const arr = history[key]
+  arr.push({ ts: Date.now(), status, responseTimeMs, lagSeconds })
+  while (arr.length > MAX_HISTORY) arr.shift()
+
+  // Update daily summary
+  const today = new Date().toISOString().slice(0, 10)
+  const dailyArr = dailyHistory[key]
+  let todaySummary = dailyArr[dailyArr.length - 1]
+  if (!todaySummary || todaySummary.date !== today) {
+    todaySummary = { date: today, total: 0, operational: 0, degraded: 0, down: 0 }
+    dailyArr.push(todaySummary)
+    while (dailyArr.length > 90) dailyArr.shift()
+  }
+  todaySummary.total++
+  todaySummary[status]++
+}
+
+async function pollAll() {
+  await Promise.all(Object.keys(services).map(k => checkService(k)))
+}
+
+// ── App ─────────────────────────────────────────────────────────────
+const app = new Hono()
+
+// Security headers. No CORS: the status HTML is same-origin server-rendered and
+// no cross-origin consumer needs to read /api/status — a wildcard ACAO would let
+// any site's JS scrape whatever this endpoint exposes. The page has no scripts
+// and only inline styles, so the CSP can be tight.
+app.use('*', secureHeaders({
+  strictTransportSecurity: 'max-age=63072000; includeSubDomains; preload',
+  xFrameOptions: 'DENY',
+  contentSecurityPolicy: {
+    defaultSrc: ["'none'"],
+    styleSrc: ["'unsafe-inline'"],
+    imgSrc: ["'self'", 'data:'],
+    baseUri: ["'none'"],
+    frameAncestors: ["'none'"],
+  },
+}))
+
+app.get('/', (c) => {
+  return c.html(html(services, history, dailyHistory))
+})
+
+app.get('/api/status', (c) => {
+  return c.json({ services, history, dailyHistory, checkedAt: new Date().toISOString() })
+})
+
+// ── Start ───────────────────────────────────────────────────────────
+pollAll()
+setInterval(pollAll, POLL_INTERVAL)
+
+serve({ fetch: app.fetch, port: PORT }, () => {
+  console.log(`[status] Listening on :${PORT}`)
+})

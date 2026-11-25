@@ -1,0 +1,198 @@
+import { DrizzleQueryError } from 'drizzle-orm'
+import { drizzle } from 'drizzle-orm/postgres-js'
+import postgres from 'postgres'
+import * as schema from './schema'
+
+// Use globalThis so the singleton survives Next.js hot-module reloads in dev.
+// Without this, each HMR cycle creates a fresh postgres pool, exhausting
+// the "too many clients" limit on the database.
+// Keyed by env var name so multiple chains can coexist in the same process.
+const g = globalThis as typeof globalThis & {
+  __db_instances?: Map<string, ReturnType<typeof drizzle>>
+  __db_sql?: Map<string, postgres.Sql>
+  __maint_instances?: Map<string, ReturnType<typeof drizzle>>
+  __maint_sql?: Map<string, postgres.Sql>
+  __writer_instances?: Map<string, ReturnType<typeof drizzle>>
+  __writer_sql?: Map<string, postgres.Sql>
+}
+
+/**
+ * Returns a singleton Drizzle DB client for the given env var.
+ * Defaults to DATABASE_URL for backwards compatibility.
+ * Each unique env var name gets its own connection pool.
+ */
+export function getDb(envVarName = 'DATABASE_URL') {
+  if (!g.__db_instances) g.__db_instances = new Map()
+  if (!g.__db_sql) g.__db_sql = new Map()
+
+  const cached = g.__db_instances.get(envVarName)
+  if (cached) return cached
+
+  const url = process.env[envVarName]
+  if (!url) {
+    if (process.env.NODE_ENV === 'production') {
+      throw new Error(`${envVarName} environment variable is not set`)
+    }
+    const dbName = envVarName === 'ETH_DATABASE_URL' ? 'ethscan' : 'bnbscan'
+    console.warn(`[db] ${envVarName} not set — DB queries will fail at runtime`)
+    const sql = postgres(`postgresql://localhost:5432/${dbName}`, { max: 1, connect_timeout: 2 })
+    g.__db_sql.set(envVarName, sql)
+    const db = drizzle(sql, { schema })
+    g.__db_instances.set(envVarName, db)
+    return db
+  }
+
+  // Pool size configurable via DB_POOL_SIZE env var.
+  // Default 5 for web app — leaves headroom for the indexer within Render's 25 connections.
+  const poolSize = parseInt(process.env.DB_POOL_SIZE ?? '5', 10) || 5
+  // Opt-in per-connection statement timeout (ms). Set on the web services so a runaway
+  // query (e.g. a COUNT/aggregation on a mega-token) is cancelled server-side and frees
+  // its pool slot, instead of hanging the request and holding the connection. Left unset
+  // (0 = disabled) for the indexer, whose batch jobs legitimately run for minutes.
+  const statementTimeoutMs = parseInt(process.env.DB_STATEMENT_TIMEOUT_MS ?? '0', 10) || 0
+  const sql = postgres(url, {
+    max: poolSize,
+    ...(statementTimeoutMs > 0 ? { connection: { statement_timeout: statementTimeoutMs } } : {}),
+    // Recycle idle connections — Render's managed Postgres (and network proxies)
+    // can silently close idle TCP connections. Without idle_timeout, the pool
+    // hands out dead connections that hang until OS-level TCP keepalive fires
+    // (minutes). 20s keeps connections fresh without thrashing.
+    idle_timeout: 20,
+    // Cap connection lifetime to prevent long-lived connections from accumulating
+    // stale prepared statements or hitting Postgres backend memory limits.
+    max_lifetime: 300,
+    // Fail fast on connection acquisition — don't wait 30s (default) if all pool
+    // slots are busy or the DB is unreachable.
+    connect_timeout: 10,
+  })
+  g.__db_sql.set(envVarName, sql)
+  const db = drizzle(sql, { schema })
+  g.__db_instances.set(envVarName, db)
+  return db
+}
+
+/**
+ * Create a dedicated, NON-pooled postgres connection for one-off maintenance work
+ * (e.g. the token_transfers partition migration) where a long index build or
+ * VALIDATE must not be recycled mid-flight. Single connection, no idle/lifetime
+ * recycling, no statement timeout. The caller MUST call `.end()` when finished.
+ */
+export function createMaintenanceConnection(url: string) {
+  return postgres(url, {
+    max: 1,
+    idle_timeout: 0,
+    max_lifetime: 0,
+    connect_timeout: 30,
+  })
+}
+
+/**
+ * Dedicated, SMALL connection pool for recurring background maintenance
+ * (retention deletes, holder-count recompute). Kept SEPARATE from the primary
+ * getDb() pool so a long-running batched DELETE or recompute can never occupy
+ * the ingestion/web pool's slots. Singleton per env var, like getDb().
+ *
+ * NOTE: this isolates connection *slots*, not disk I/O — the callers still chunk
+ * and throttle their work (sleep between batches) to bound I/O on the shared DB,
+ * which is the actual bottleneck that stalled ingestion. Unlike
+ * createMaintenanceConnection() (a one-off, non-recycled connection for DDL), this
+ * pool recycles idle/old connections so it stays healthy for the process lifetime.
+ * Pool size via MAINTENANCE_POOL_SIZE (default 2).
+ */
+export function getMaintenanceDb(envVarName = 'DATABASE_URL') {
+  if (!g.__maint_instances) g.__maint_instances = new Map()
+  if (!g.__maint_sql) g.__maint_sql = new Map()
+
+  const cached = g.__maint_instances.get(envVarName)
+  if (cached) return cached
+
+  const url = process.env[envVarName]
+  if (!url) {
+    // Dev / unset: fall back to the shared handle so callers still work.
+    return getDb(envVarName)
+  }
+
+  const poolSize = parseInt(process.env.MAINTENANCE_POOL_SIZE ?? '2', 10) || 2
+  const sql = postgres(url, {
+    max: poolSize,
+    idle_timeout: 20,
+    max_lifetime: 300,
+    connect_timeout: 10,
+  })
+  g.__maint_sql.set(envVarName, sql)
+  const db = drizzle(sql, { schema })
+  g.__maint_instances.set(envVarName, db)
+  return db
+}
+
+/**
+ * Dedicated pool for the indexer's async transfer writer.
+ *
+ * WHY THIS EXISTS. Measured on BNB 2026-08-17: the writer sustains 919 rows/s
+ * while block workers are parked on backpressure, and only ~701 rows/s is needed
+ * to match chain — yet the system averages ~594 and the lag grows. The writer is
+ * fast enough; producing and draining just do not overlap. One candidate cause is
+ * that the writer is the (INDEX_CONCURRENCY + 1)-th consumer of a DB_POOL_SIZE
+ * pool — 8 and 8 on BNB — and `writeTransferBlocks` holds a slot for an entire
+ * transaction, so it competes with the very workers whose output it is draining.
+ *
+ * This is deliberately the INTERVENTION rather than another observational probe.
+ * Timing the writer's connection checkout from inside the process cannot separate
+ * pool wait from event-loop scheduling delay (both inflate the same span), so the
+ * sound test is to remove the contention and measure throughput — the same
+ * "verify by intervention" correction that a mis-sampled queue depth forced
+ * earlier the same day.
+ *
+ * Same isolation rationale as getMaintenanceDb: separate connection SLOTS, not
+ * separate disk I/O. Opt-in via TT_WRITER_DEDICATED_POOL so it can be A/B'd
+ * against a known baseline and reverted with an env var, and sized by
+ * TT_WRITER_POOL_SIZE (default 2 — the writer is a single serialized drainer, so
+ * it needs one slot plus headroom for the watermark UPDATE, not a pool).
+ *
+ * NOTE total connections: this ADDS to the process's footprint (ingestion +
+ * maintenance + writer). Render's plan caps max_connections, so raising
+ * TT_WRITER_POOL_SIZE is not free.
+ */
+export function getWriterDb(envVarName = 'DATABASE_URL') {
+  if (process.env.TT_WRITER_DEDICATED_POOL !== '1') return getDb(envVarName)
+  if (!g.__writer_instances) g.__writer_instances = new Map()
+  if (!g.__writer_sql) g.__writer_sql = new Map()
+
+  const cached = g.__writer_instances.get(envVarName)
+  if (cached) return cached
+
+  const url = process.env[envVarName]
+  if (!url) return getDb(envVarName)
+
+  const poolSize = parseInt(process.env.TT_WRITER_POOL_SIZE ?? '2', 10) || 2
+  const sql = postgres(url, {
+    max: poolSize,
+    idle_timeout: 20,
+    max_lifetime: 300,
+    connect_timeout: 10,
+  })
+  g.__writer_sql.set(envVarName, sql)
+  const db = drizzle(sql, { schema })
+  g.__writer_instances.set(envVarName, db)
+  return db
+}
+
+/**
+ * The error the driver threw for a failed query. drizzle-orm >= 0.44 rethrows it
+ * as a DrizzleQueryError whose message is the SQL and its params, so what
+ * Postgres said ("deadlock detected", "canceling statement due to statement
+ * timeout") and its code are only on `.cause`. Anything else comes back as is.
+ * Read this, not the wrapper, to classify a DB error or to log one.
+ */
+export function unwrapDbError(err: unknown): unknown {
+  return err instanceof DrizzleQueryError && err.cause !== undefined ? err.cause : err
+}
+
+/** What the database said about a failed query, as a string. */
+export function dbErrorMessage(err: unknown): string {
+  const e = unwrapDbError(err)
+  return e instanceof Error ? e.message : String(e)
+}
+
+export { schema }
+export type Db = ReturnType<typeof getDb>

@@ -1,0 +1,29 @@
+{
+  "name": "@altscan/indexer",
+  "license": "AGPL-3.0-only",
+  "version": "0.0.1",
+  "main": "dist/index.js",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "backfill": "tsx src/backfill.ts",
+    "migrate-partition": "node dist/migrate-partition-tt.js",
+    "migrate-partition:dev": "tsx src/migrate-partition-tt.ts"
+  },
+  "dependencies": {
+    "@altscan/chain-config": "workspace:*",
+    "@altscan/db": "workspace:*",
+    "@altscan/providers": "workspace:*",
+    "@altscan/types": "workspace:*",
+    "axios": "^1.21.1",
+    "dotenv": "^16.4.0",
+    "drizzle-orm": "^0.45.4",
+    "ethers": "^6.17.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.19.43",
+    "tsx": "^4.23.15",
+    "typescript": "^5.4.0"
+  }
+}

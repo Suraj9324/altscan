@@ -1,0 +1,559 @@
+import { describe, it, expect, vi, afterEach } from 'vitest'
+import {
+  bucketFor,
+  buildClaimSql,
+  mapHistoryRows,
+  mapTransferRows,
+  processOnePage,
+  backfillPressure,
+  sharedBucketOverHeadroom,
+  type ClaimedEntity,
+  type WorkerDb,
+} from './backfill-worker'
+import { cfg } from './backfill-budget'
+import type { ProviderAdapter, ProviderTx, ProviderTokenTransfer } from '@altscan/providers'
+
+/**
+ * String-level pins for the claim statement (Task 2.2). These are the
+ * CI-runnable half: they pin the exact predicates and ordering the design
+ * requires (R2 lease, R6 fairness), byte-for-byte from the shipped builder —
+ * not a reimplementation. The behavioral half (one winner under concurrency,
+ * lease reclaim against a real clock) runs in backfill-worker.pg.test.ts,
+ * gated on a local Postgres.
+ */
+describe('buildClaimSql — the shipped claim statement', () => {
+  const text = buildClaimSql()
+
+  it('is single-flight: FOR UPDATE SKIP LOCKED on a LIMIT 1 subquery', () => {
+    expect(text).toContain('FOR UPDATE SKIP LOCKED')
+    expect(text).toContain('LIMIT 1')
+    expect(text).toContain('SELECT id FROM backfill_watermarks')
+  })
+
+  it('claims pending and partial work', () => {
+    expect(text).toContain(`status IN ('pending','partial')`)
+  })
+
+  it('R2: reclaims a running row only after a full lease has elapsed', () => {
+    expect(text).toContain(
+      `(status = 'running' AND last_attempt_at < now() - (${cfg.leaseSec} * INTERVAL '1 second'))`,
+    )
+  })
+
+  it('errored rows wait out an exponential cooldown capped at 1800s', () => {
+    expect(text).toContain(
+      `(status = 'error' AND attempts < ${cfg.maxAttempts} AND (last_attempt_at IS NULL OR last_attempt_at < now() - (LEAST(pow(2, LEAST(attempts, 11)), 1800) * INTERVAL '1 second')))`,
+    )
+  })
+
+  it('gives up past maxAttempts — the cooldown ALONE retries forever', () => {
+    // The exponent is capped at 11 and the interval at 1800s, so backoff
+    // plateaus at 30 minutes and never grows again. With no give-up bound an
+    // entity that ALWAYS fails is re-claimed every half hour indefinitely,
+    // spending provider CU on every attempt. Measured in prod 2026-09-09: four
+    // such rows were the ENTIRE upstream-5xx population, one at 1,079 attempts.
+    expect(text).toContain(`attempts < ${cfg.maxAttempts}`)
+    // It must gate the ERROR arm specifically. Hoisted into the outer WHERE it
+    // would also block pending/partial work, freezing the queue instead.
+    expect(text).toMatch(/status = 'error' AND attempts < \d+ AND \(last_attempt_at/)
+    expect(text).toContain(`status IN ('pending','partial')`)
+  })
+
+  it('R6: drains partial work before pending, whose NULL last_attempt_at would otherwise preempt', () => {
+    expect(text).toContain(
+      `ORDER BY (status = 'partial') DESC, last_attempt_at ASC NULLS FIRST, created_at ASC`,
+    )
+  })
+
+  it('bucket exclusion ANDs against the parenthesized eligibility block', () => {
+    // Without the parens the NOT IN would bind to the last OR arm only, and a
+    // hot bucket's pending/partial rows would still be claimable.
+    expect(text).toContain(`WHERE (status IN ('pending','partial')`)
+    expect(text).not.toContain('NOT IN')
+    const excluded = buildClaimSql(['token_transfers'])
+    expect(excluded).toContain(`AND entity_type NOT IN ('token_transfers')`)
+  })
+
+  it('claiming renews the lease with a millisecond-exact stamp and returns the full row', () => {
+    // date_trunc to ms: the stamp round-trips through a JS Date losslessly, so
+    // it doubles as the FENCING TOKEN every later transition must present.
+    expect(text).toMatch(
+      /UPDATE backfill_watermarks SET status = 'running', last_attempt_at = date_trunc\('milliseconds', now\(\)\), updated_at = now\(\)/,
+    )
+    expect(text).toContain('RETURNING *')
+  })
+})
+
+// ── Task 2.3: pure row mappers — where the O1 worker invariants live ──
+
+const ADDR = '0x' + 'Aa'.repeat(20)
+const HASH = '0x' + 'Bc'.repeat(32)
+
+const tx = (over: Partial<ProviderTx> = {}): ProviderTx => ({
+  hash: HASH,
+  blockNumber: '123',
+  blockTimestamp: '2026-07-01T00:00:00.000Z',
+  fromAddress: '0xfrom',
+  toAddress: '0xto',
+  value: '1000',
+  gasPrice: '0',
+  gasUsed: '0',
+  category: 'send',
+  summary: 's',
+  possibleSpam: false,
+  erc20Transfers: [],
+  ...over,
+})
+
+const transfer = (over: Partial<ProviderTokenTransfer> = {}): ProviderTokenTransfer => ({
+  txHash: HASH,
+  logIndex: '7',
+  blockNumber: '123',
+  blockTimestamp: '2026-07-01T00:00:00.000Z',
+  fromAddress: '0xfrom',
+  toAddress: '0xto',
+  tokenAddress: '0xToken',
+  tokenName: 'T',
+  tokenSymbol: 'TKN',
+  tokenDecimals: '18',
+  value: '5',
+  valueFormatted: '0.000005',
+  ...over,
+})
+
+describe('mapHistoryRows — O1: identity fields are stored lowercase', () => {
+  it('lowercases the scope address and tx hash, preserving payload fields', () => {
+    const [row] = mapHistoryRows(ADDR, [tx()])
+    expect(row.address).toBe(ADDR.toLowerCase())
+    expect(row.txHash).toBe(HASH.toLowerCase())
+    expect(row.fromAddress).toBe('0xfrom')
+    expect(row.value).toBe('1000')
+    expect(row.possibleSpam).toBe(false)
+  })
+
+  it('parses ISO and epoch-second timestamps and numeric block numbers', () => {
+    const [iso] = mapHistoryRows(ADDR, [tx()])
+    expect(iso.blockNumber).toBe(123)
+    expect(iso.blockTimestamp.toISOString()).toBe('2026-07-01T00:00:00.000Z')
+    const [epoch] = mapHistoryRows(ADDR, [tx({ blockTimestamp: '1782864000' })])
+    expect(epoch.blockTimestamp.getTime()).toBe(1782864000_000)
+  })
+})
+
+describe('mapTransferRows — O1: skip rows with no usable log_index, never invent one', () => {
+  it('skips null, empty, and non-integer logIndex rows and counts them', () => {
+    const { rows, skipped } = mapTransferRows(ADDR, [
+      transfer({ logIndex: null }),
+      transfer({ logIndex: '' }),
+      transfer({ logIndex: 'abc' }),
+      transfer({ logIndex: '-1' }),
+      transfer({ logIndex: '1.5' }),
+      transfer({ logIndex: '0' }),
+      transfer({ logIndex: '292' }),
+    ])
+    expect(skipped).toBe(5)
+    expect(rows.map((r) => r.logIndex)).toEqual([0, 292])
+  })
+
+  it('lowercases scope + tx hash and parses decimals, leaving payload untouched', () => {
+    const { rows } = mapTransferRows(ADDR, [transfer()])
+    expect(rows[0].scopeAddress).toBe(ADDR.toLowerCase())
+    expect(rows[0].txHash).toBe(HASH.toLowerCase())
+    expect(rows[0].tokenAddress).toBe('0xToken')
+    expect(rows[0].tokenDecimals).toBe(18)
+    const { rows: noDec } = mapTransferRows(ADDR, [transfer({ tokenDecimals: null as unknown as string })])
+    expect(noDec[0].tokenDecimals).toBeNull()
+  })
+})
+
+// ── Task 2.3: processOnePage status machine (fake db — effects proven in the PG suite) ──
+
+function fakeDb(opts: { fenceMatches?: boolean; writeFails?: Error } = {}) {
+  // Guarded UPDATEs use RETURNING id — a matched fence returns a row, a lost
+  // lease returns none.
+  const guardRow = opts.fenceMatches === false ? [] : [{ id: 1 }]
+  const executed: unknown[] = []
+  const db = {
+    execute: vi.fn(async (q: unknown) => {
+      executed.push(q)
+      return guardRow
+    }),
+    transaction: vi.fn(async (fn: (txx: { execute: (q: unknown) => Promise<unknown[]> }) => Promise<unknown>) =>
+      fn({
+        execute: async (q: unknown) => {
+          executed.push(q)
+          // The upsert is the FIRST statement inside the page transaction, so
+          // throwing here reproduces the shipped failure exactly: Postgres
+          // rejects the row and the whole transaction rolls back, taking the
+          // watermark advance with it.
+          if (opts.writeFails) throw opts.writeFails
+          return guardRow
+        },
+      }),
+    ),
+  }
+  return { db: db as unknown as WorkerDb, executed, raw: db }
+}
+
+/** The literal SQL text of a drizzle template (bound params excluded) — enough
+ *  to pin which columns a guarded UPDATE actually sets. Recurses, because
+ *  fencedUpdate nests the caller's `set` clause inside its own template. */
+function sqlText(q: unknown): string {
+  const node = q as { queryChunks?: unknown[]; value?: unknown }
+  if (Array.isArray(node?.queryChunks)) return node.queryChunks.map(sqlText).join('')
+  if (Array.isArray(node?.value)) return node.value.join('')
+  return ''
+}
+
+const entity = (over: Partial<ClaimedEntity> = {}): ClaimedEntity => ({
+  id: 1,
+  entity_type: 'address_txs',
+  entity_id: ADDR.toLowerCase(),
+  status: 'running',
+  backfilled_through_block: null,
+  oldest_cursor: null,
+  rows_written: 0,
+  attempts: 0,
+  last_attempt_at: new Date(), // the claim stamp — doubles as the fence token
+  last_error: null,
+  ...over,
+})
+
+const providerOf = (impl: Partial<ProviderAdapter>): ProviderAdapter =>
+  ({ kind: 'fake', ...impl }) as ProviderAdapter
+
+describe('processOnePage — status machine', () => {
+  it('returns complete when the provider cursor is exhausted', async () => {
+    const { db } = fakeDb()
+    const provider = providerOf({
+      getAddressHistory: async () => ({ ok: true, data: { txs: [tx()], cursor: null, totalTxs: 1 } }),
+    })
+    expect(await processOnePage(db, provider, entity())).toBe('complete')
+  })
+
+  it('returns partial while a cursor remains under the cap', async () => {
+    const { db } = fakeDb()
+    const provider = providerOf({
+      getAddressHistory: async () => ({ ok: true, data: { txs: [tx()], cursor: 'next', totalTxs: 999 } }),
+    })
+    expect(await processOnePage(db, provider, entity())).toBe('partial')
+  })
+
+  it('returns capped once total rows reach the per-entity cap', async () => {
+    const { db } = fakeDb()
+    const provider = providerOf({
+      getAddressHistory: async () => ({
+        ok: true,
+        data: { txs: Array.from({ length: 25 }, (_, i) => tx({ hash: `0xh${i}` })), cursor: 'next', totalTxs: 9999 },
+      }),
+    })
+    expect(await processOnePage(db, provider, entity({ rows_written: cfg.maxRowsPerEntity - 10 }))).toBe('capped')
+  })
+
+  it('an exhausted cursor is complete even at the cap — capped must promise a provider continuation', async () => {
+    const { db } = fakeDb()
+    const provider = providerOf({
+      getAddressHistory: async () => ({
+        ok: true,
+        data: { txs: Array.from({ length: 25 }, (_, i) => tx({ hash: `0xh${i}` })), cursor: null, totalTxs: 9999 },
+      }),
+    })
+    expect(await processOnePage(db, provider, entity({ rows_written: cfg.maxRowsPerEntity - 10 }))).toBe('complete')
+  })
+
+  it('a rate-limited page releases the claim back to pending/partial without burning attempts', async () => {
+    const provider = providerOf({
+      getAddressHistory: async () => ({ ok: false, reason: 'rate_limited' }),
+    })
+    const a = fakeDb()
+    expect(await processOnePage(a.db, provider, entity())).toBe('pending')
+    const b = fakeDb()
+    expect(await processOnePage(b.db, provider, entity({ rows_written: 50 }))).toBe('partial')
+  })
+
+  it('OPERATIONAL failures never burn an attempt — a kill switch must not strand entities', async () => {
+    // `disabled` and `not_configured` are the kill switch and a missing key:
+    // the entity is fine, the provider is not. Burning attempts on them marches
+    // every entity to the give-up bound during an outage and strands it there
+    // permanently, and enqueueBackfill is ON CONFLICT DO NOTHING so re-enqueue
+    // cannot revive it. They must release the claim exactly like rate_limited.
+    for (const reason of ['disabled', 'not_configured', 'rate_limited'] as const) {
+      const provider = providerOf({ getAddressHistory: async () => ({ ok: false, reason }) })
+      const a = fakeDb()
+      expect(await processOnePage(a.db, provider, entity()), reason).toBe('pending')
+      const b = fakeDb()
+      expect(await processOnePage(b.db, provider, entity({ rows_written: 50 })), reason).toBe('partial')
+    }
+  })
+
+  it('exhausting the bound with rows already cached CAPS rather than errors', async () => {
+    // 'error' is not cacheUsable(), which accepts only complete/capped/partial.
+    // Leaving an exhausted entity there permanently hides pages it had already
+    // cached, from both normal serving and provider-outage fallback. 'capped'
+    // means "we stopped fetching; the tail lives at the provider" — exactly a
+    // given-up entity — and it is not claimable, so retries stop either way.
+    const provider = providerOf({
+      getAddressHistory: async () => ({ ok: false, reason: 'upstream_error' }),
+    })
+    const withRows = fakeDb()
+    expect(
+      await processOnePage(withRows.db, provider, entity({ rows_written: 50, attempts: cfg.maxAttempts - 1 })),
+    ).toBe('capped')
+    // Nothing cached: no tail to preserve and no cursor to resume from, so
+    // 'error' is right — the claim bound already stops it being re-selected.
+    const noRows = fakeDb()
+    expect(
+      await processOnePage(noRows.db, provider, entity({ rows_written: 0, attempts: cfg.maxAttempts - 1 })),
+    ).toBe('error')
+    // One below the bound still errors normally and keeps retrying.
+    const below = fakeDb()
+    expect(
+      await processOnePage(below.db, provider, entity({ rows_written: 50, attempts: cfg.maxAttempts - 2 })),
+    ).toBe('error')
+  })
+
+  it('an upstream failure or thrown provider error marks the watermark error', async () => {
+    const a = fakeDb()
+    expect(
+      await processOnePage(
+        a.db,
+        providerOf({ getAddressHistory: async () => ({ ok: false, reason: 'upstream_error' }) }),
+        entity(),
+      ),
+    ).toBe('error')
+    const b = fakeDb()
+    expect(
+      await processOnePage(
+        b.db,
+        providerOf({
+          getAddressHistory: async () => {
+            throw new Error('boom')
+          },
+        }),
+        entity(),
+      ),
+    ).toBe('error')
+    expect(b.raw.execute).toHaveBeenCalled()
+  })
+
+  it('routes token_transfers entities to getAddressTokenTransfers', async () => {
+    const { db } = fakeDb()
+    const getAddressTokenTransfers = vi.fn(async () => ({
+      ok: true as const,
+      data: { transfers: [transfer()], cursor: null },
+    }))
+    const provider = providerOf({ getAddressTokenTransfers })
+    expect(await processOnePage(db, provider, entity({ entity_type: 'token_transfers' }))).toBe('complete')
+    expect(getAddressTokenTransfers).toHaveBeenCalledWith(ADDR.toLowerCase(), undefined)
+  })
+
+  it('caps WITHOUT writing when a transfers page contains an unusable log_index (no torn coverage)', async () => {
+    // Worker-side twin of the A4b-1 serve ALL-OR-SKIP rule: advancing the
+    // cursor past a skipped row would leave a permanent hole in the cached
+    // tail. The page is left uncached and the entity capped, so serving falls
+    // through to the provider exactly at this page.
+    const { db, raw } = fakeDb()
+    const provider = providerOf({
+      getAddressTokenTransfers: async () => ({
+        ok: true,
+        data: { transfers: [transfer(), transfer({ logIndex: null, txHash: '0xother' })], cursor: 'next' },
+      }),
+    })
+    expect(await processOnePage(db, provider, entity({ entity_type: 'token_transfers' }))).toBe('capped')
+    expect(raw.transaction).not.toHaveBeenCalled() // nothing written, cursor untouched
+  })
+
+  it('reports lease_lost instead of writing when the fence no longer matches', async () => {
+    const lost = fakeDb({ fenceMatches: false })
+    expect(
+      await processOnePage(
+        lost.db,
+        providerOf({ getAddressHistory: async () => ({ ok: false, reason: 'upstream_error' }) }),
+        entity(),
+      ),
+    ).toBe('lease_lost')
+
+    const lostTxn = fakeDb({ fenceMatches: false })
+    expect(
+      await processOnePage(
+        lostTxn.db,
+        providerOf({
+          getAddressHistory: async () => ({ ok: true, data: { txs: [tx()], cursor: null, totalTxs: 1 } }),
+        }),
+        entity(),
+      ),
+    ).toBe('lease_lost')
+  })
+})
+
+// ── Task 2.3: R5 pressure + BNB headroom politeness ──
+
+describe('backfillPressure (R5)', () => {
+  afterEach(() => {
+    vi.unstubAllEnvs()
+  })
+
+  const dbReturning = (bfBytes: number, dbBytes: number) =>
+    ({
+      execute: async () => [{ bf_bytes: String(bfBytes), db_bytes: String(dbBytes) }],
+      transaction: async () => null,
+    }) as unknown as WorkerDb
+
+  it('is quiet under both bounds', async () => {
+    expect(await backfillPressure(dbReturning(1 * 1024 ** 3, 50 * 1024 ** 3), 150)).toBeNull()
+  })
+
+  it('stops at the backfill byte ceiling', async () => {
+    const msg = await backfillPressure(dbReturning(cfg.maxTotalGb * 1024 ** 3, 50 * 1024 ** 3))
+    expect(msg).toMatch(/ceiling/)
+  })
+
+  it('stops at the disk percentage bound when DB_DISK_GB is known', async () => {
+    expect(await backfillPressure(dbReturning(0, 71 * 1024 ** 3), 100)).toMatch(/disk/)
+    expect(await backfillPressure(dbReturning(0, 69 * 1024 ** 3), 100)).toBeNull()
+  })
+
+  it('skips the disk bound when DB_DISK_GB is unset', async () => {
+    expect(await backfillPressure(dbReturning(0, 900 * 1024 ** 3), 0)).toBeNull()
+  })
+})
+
+describe('sharedBucketOverHeadroom — BNB politeness, per-bucket, inert without a fleet signal', () => {
+  const healthWith = (buckets: Record<string, unknown>) => async () =>
+    ({ buckets }) as Record<string, unknown>
+
+  it('yields once the checked bucket crosses headroom × cap', async () => {
+    expect(await sharedBucketOverHeadroom('history', healthWith({ history: { hourly: 280, hourlyMax: 700 } }))).toBe(true)
+    expect(await sharedBucketOverHeadroom('history', healthWith({ history: { hourly: 279, hourlyMax: 700 } }))).toBe(false)
+  })
+
+  it('checks the bucket the claimed entity will actually spend from', async () => {
+    // Transfers spend the assets bucket, not history (moralis acquire('assets')).
+    const health = healthWith({
+      history: { hourly: 0, hourlyMax: 700 },
+      assets: { hourly: 400, hourlyMax: 400 },
+    })
+    expect(await sharedBucketOverHeadroom('assets', health)).toBe(true)
+    expect(await sharedBucketOverHeadroom('history', health)).toBe(false)
+  })
+
+  it('maps entity types to their provider buckets', () => {
+    expect(bucketFor('address_txs')).toBe('history')
+    expect(bucketFor('token_transfers')).toBe('assets')
+  })
+
+  it('returns false when there is no counter (no Redis — ETH), no bucket, or a health error', async () => {
+    expect(await sharedBucketOverHeadroom('history', healthWith({ history: { hourly: null, hourlyMax: 700 } }))).toBe(false)
+    expect(await sharedBucketOverHeadroom('history', healthWith({}))).toBe(false)
+    expect(
+      await sharedBucketOverHeadroom('history', async () => {
+        throw new Error('redis blip')
+      }),
+    ).toBe(false)
+  })
+})
+
+// ---- The ETH hot loop (2026-08-24): provider metadata must be STORABLE ----
+//
+// `sanitizeTokenMetadata` has existed (and been tested) since the live-indexer
+// path needed it, but the backfill mappers bound provider strings raw. One NUL
+// byte in a token symbol made every INSERT throw, and because a failed write
+// never marked the watermark, the entity was re-claimed every lease forever at
+// ~100 non-refunded budget pages/hour. Both halves are pinned below.
+
+describe('mapper sanitization -- unstorable provider metadata', () => {
+  it('strips the NUL byte Postgres rejects from a token symbol', () => {
+    const { rows } = mapTransferRows(ADDR, [transfer({ tokenSymbol: 'TK\u0000N' })])
+    expect(rows[0].tokenSymbol).toBe('TKN')
+  })
+
+  it('strips control bytes from value_formatted', () => {
+    const { rows } = mapTransferRows(ADDR, [transfer({ valueFormatted: '0.5\u0000\u0007' })])
+    expect(rows[0].valueFormatted).toBe('0.5')
+  })
+
+  it('truncates an over-long symbol to VARCHAR(64) rather than letting the INSERT fail', () => {
+    const { rows } = mapTransferRows(ADDR, [transfer({ tokenSymbol: 'S'.repeat(200) })])
+    expect(rows[0].tokenSymbol).toHaveLength(64)
+  })
+
+  it('never truncates value_formatted or summary — TEXT columns, and a cap would corrupt', () => {
+    // A high-decimals token puts the first significant digit far to the right.
+    // Truncating before it turns a real amount into "0.000..." on the serve
+    // path, which is worse than the unstorable byte we came here to fix.
+    const tiny = '0.' + '0'.repeat(300) + '42'
+    const { rows } = mapTransferRows(ADDR, [transfer({ valueFormatted: tiny })])
+    expect(rows[0].valueFormatted).toBe(tiny)
+
+    const long = 'y'.repeat(9000)
+    const [h] = mapHistoryRows(ADDR, [tx({ summary: long })])
+    expect(h.summary).toBe(long)
+  })
+
+  it('keeps a genuinely absent symbol NULL instead of fabricating one', () => {
+    const { rows } = mapTransferRows(ADDR, [
+      transfer({ tokenSymbol: null as unknown as string }),
+    ])
+    expect(rows[0].tokenSymbol).toBeNull()
+  })
+
+  it('strips control bytes from history summary and category', () => {
+    const [row] = mapHistoryRows(ADDR, [tx({ summary: 'a\u0000b', category: 'se\u0000nd' })])
+    expect(row.summary).toBe('ab')
+    expect(row.category).toBe('send')
+  })
+
+  it('leaves clean metadata byte-identical', () => {
+    const { rows } = mapTransferRows(ADDR, [transfer()])
+    expect(rows[0].tokenSymbol).toBe('TKN')
+    expect(rows[0].valueFormatted).toBe('0.000005')
+    const [h] = mapHistoryRows(ADDR, [tx()])
+    expect(h.summary).toBe('s')
+    expect(h.category).toBe('send')
+  })
+})
+
+describe('processOnePage -- a failed WRITE must burn an attempt', () => {
+  const pageOfOne = () =>
+    providerOf({
+      getAddressHistory: async () => ({
+        ok: true as const,
+        data: { txs: [tx()], cursor: null, totalTxs: 1 },
+      }),
+    })
+  const writeFails = () => new Error('invalid byte sequence for encoding "UTF8": 0x00')
+
+  it('marks the watermark error instead of rethrowing out of the worker loop', async () => {
+    const { db } = fakeDb({ writeFails: writeFails() })
+    await expect(processOnePage(db, pageOfOne(), entity())).resolves.toBe('error')
+  })
+
+  it('increments attempts, which is the ONLY thing that arms the claim cooldown', async () => {
+    // buildClaimSql re-claims an errored row after LEAST(pow(2, attempts),
+    // 1800)s. Leaving status='running' with attempts=0 makes that cooldown
+    // unreachable -- the row returns every lease, forever.
+    const { db, executed } = fakeDb({ writeFails: writeFails() })
+    await processOnePage(db, pageOfOne(), entity())
+    const recovery = executed.map(sqlText).find((t) => t.includes('attempts=attempts+1'))
+    expect(recovery).toBeDefined()
+    expect(recovery).toContain("status='error'")
+    expect(recovery).toContain('last_attempt_at=now()')
+    expect(recovery).toContain('UPDATE backfill_watermarks')
+  })
+
+  it('the recovery UPDATE runs on the outer db, not the rolled-back transaction', async () => {
+    const { db, raw } = fakeDb({ writeFails: writeFails() })
+    await processOnePage(db, pageOfOne(), entity())
+    expect(raw.execute).toHaveBeenCalled()
+  })
+
+  it('reports lease_lost when the fence is gone, without claiming an error it cannot record', async () => {
+    const { db } = fakeDb({ writeFails: writeFails(), fenceMatches: false })
+    await expect(processOnePage(db, pageOfOne(), entity())).resolves.toBe('lease_lost')
+  })
+
+  it('still surfaces a lost lease as lease_lost, not error', async () => {
+    const { db } = fakeDb({ fenceMatches: false })
+    await expect(processOnePage(db, pageOfOne(), entity())).resolves.toBe('lease_lost')
+  })
+})

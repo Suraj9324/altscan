@@ -1,0 +1,2386 @@
+import { getChainConfig } from '@altscan/chain-config'
+import { decodeV2Swap, resolveV2Pair, SWAP_V2_TOPIC, V2_FACTORIES, type V2Pair, type V2PairReader } from './dex-swap'
+import { indexerConfig } from './config-instance'
+import { JsonRpcProvider, Log as EthersLog, AbiCoder, Contract, id as keccak256id, isError } from 'ethers'
+import { sql } from 'drizzle-orm'
+import { getDb, getWriterDb, schema, dbErrorMessage, unwrapDbError } from './db'
+import { withTimeout } from './rpc-failover'
+import { ensureForwardPartitions } from './ensure-schema'
+import { recordIndexGapIfAbsent } from './index-gaps'
+import { notifyWebhooks } from './webhook-notifier'
+import { getProvider, safeRpcError } from './provider'
+import { fetchTokenMetadata, isTransportError, UNKNOWN_NAME, UNKNOWN_SYMBOL } from './token-metadata'
+import { createFanoutStats } from './fanout-stats'
+import { boundedRead, createLimiter, PAIR_RESOLVE_PER_BLOCK, POST_WRITE_CONCURRENCY, TOKEN_FETCH_PER_BLOCK, WARM_PAIR_BLOCKS, WARM_PAIR_MAX, warmPairs, withinBudget, type WarmPairRow } from './post-write-budget'
+import { fetchBlockTraces, MAX_TRACE_ADDRESS_LEN, prepareInternalTxRows, type InternalTxRow, type RawTraceTx } from './internal-tx'
+
+// ── Topic signatures ────────────────────────────────────────────────
+const TRANSFER_TOPIC = keccak256id('Transfer(address,address,uint256)')
+const TRANSFER_SINGLE_TOPIC = keccak256id('TransferSingle(address,address,address,uint256,uint256)')
+// Every V2-shaped swap is recorded under the chain's best-known AMM: "PancakeSwap
+// V2" on BNB, "Uniswap V2" on Ethereum. It was hard-coded to PancakeSwap, which
+// would have labelled every Ethereum trade as a BNB Chain DEX.
+
+const ZERO_ADDRESS = '0x0000000000000000000000000000000000000000'
+const abi = AbiCoder.defaultAbiCoder()
+
+// Drizzle's sql.join() builds a recursive SQL tree — one level per row.
+// Dense blocks (ETH DeFi) can have 3000+ token transfer deltas, which
+// blows V8's ~10K call stack limit in buildQueryFromSourceParams().
+// Cap all sql.join/insert batches to stay well within the limit.
+const SQL_BATCH_CHUNK = 500
+
+// ── Async token_transfers writer flag ────────────────────────────────
+// When ON, token_transfers INSERTs move off the per-block hot path into a single
+// crash-safe coalescing writer (see "Async token_transfers writer" section + the
+// indexer_cursor watermark). Default ON for BNB (0.45s blocks need it), OFF for
+// ETH (12s blocks are fine on the synchronous inline path). Override with
+// ASYNC_TT_WRITER=1/0. When OFF, behavior is byte-for-byte today's inline path.
+const ASYNC_TT_WRITER = indexerConfig.transferWriter.async
+
+// ── Per-phase profiling (opt-in) ─────────────────────────────────────
+// Enable with PROFILE_BLOCKS=N (e.g. 30) — logs a phase breakdown every
+// N blocks to find the dominant cost center. Zero overhead when disabled.
+const PROFILE_BLOCKS = indexerConfig.indexing.profileBlocks
+
+// Ceiling on pure RPC acquisition per block.
+//
+// Measured rpcBlockWait in production averages 275-428ms, so 8s is ~20x the mean
+// and a comfortable ceiling for a dense block under load. Sized deliberately
+// tight: bsc.publicnode.com rejects EVERY archive request, so with 4 endpoints
+// roughly a quarter of attempts start there and pay this timeout before failing
+// over. At 90s that cost the batch ~90s; at 8s it costs ~8s. A false timeout on
+// a merely-slow endpoint is harmless — this bounds a PURE READ, so failover just
+// re-fetches elsewhere.
+const RPC_FETCH_TIMEOUT_MS = indexerConfig.rpc.fetchTimeoutMs
+const PROFILE_ENABLED = PROFILE_BLOCKS > 0
+
+type PhaseTimings = {
+  rpcBlockWait: number
+  rpcReceiptsWait: number
+  dbInsertBlock: number
+  dbInsertTxs: number
+  dbUpsertAddresses: number
+  dbUpdateTxStatus: number
+  dbInsertTokenTransfers: number
+  rpcEnsureTokens: number
+  dbUpdateHolderBalances: number
+  rpcPairTokens: number
+  dbInsertDexTrades: number
+  txCount: number
+  transferCount: number
+  dexCount: number
+  totalMs: number
+}
+
+const PROFILE_PHASES = [
+  'rpcBlockWait', 'rpcReceiptsWait', 'dbInsertBlock', 'dbInsertTxs',
+  'dbUpsertAddresses', 'dbUpdateTxStatus', 'dbInsertTokenTransfers',
+  'rpcEnsureTokens', 'dbUpdateHolderBalances', 'rpcPairTokens', 'dbInsertDexTrades',
+] as const
+
+type PhaseKey = typeof PROFILE_PHASES[number]
+
+type PhaseStat = { total: number; count: number; rows: number }
+
+let profileAgg: Record<string, PhaseStat> = {}
+let profileBlocksSinceReport = 0
+let profileWindowStart = Date.now()
+
+function resetProfile() {
+  profileAgg = { __total: { total: 0, count: 0, rows: 0 } }
+  for (const p of PROFILE_PHASES) profileAgg[p] = { total: 0, count: 0, rows: 0 }
+  profileBlocksSinceReport = 0
+  profileWindowStart = Date.now()
+}
+if (PROFILE_ENABLED) {
+  resetProfile()
+  console.log(`[profile] Per-phase timing enabled — reports every ${PROFILE_BLOCKS} blocks`)
+}
+
+function newTimings(): PhaseTimings {
+  return {
+    rpcBlockWait: 0, rpcReceiptsWait: 0, dbInsertBlock: 0, dbInsertTxs: 0,
+    dbUpsertAddresses: 0, dbUpdateTxStatus: 0, dbInsertTokenTransfers: 0,
+    rpcEnsureTokens: 0, dbUpdateHolderBalances: 0, rpcPairTokens: 0, dbInsertDexTrades: 0,
+    txCount: 0, transferCount: 0, dexCount: 0, totalMs: 0,
+  }
+}
+
+function recordTimings(t: PhaseTimings) {
+  profileAgg.__total.total += t.totalMs
+  profileAgg.__total.count += 1
+  profileAgg.__total.rows += t.txCount
+
+  for (const p of PROFILE_PHASES) {
+    const ms = t[p]
+    if (ms > 0) {
+      profileAgg[p].total += ms
+      profileAgg[p].count += 1
+    }
+  }
+  profileAgg.dbInsertTxs.rows += t.txCount
+  profileAgg.dbInsertTokenTransfers.rows += t.transferCount
+  profileAgg.dbUpdateHolderBalances.rows += t.transferCount
+  profileAgg.dbInsertDexTrades.rows += t.dexCount
+
+  profileBlocksSinceReport += 1
+  if (profileBlocksSinceReport >= PROFILE_BLOCKS) {
+    reportProfile()
+    resetProfile()
+  }
+}
+
+function reportProfile() {
+  const windowMs = Date.now() - profileWindowStart
+  const blocks = profileAgg.__total.count
+  if (blocks === 0) return
+  const totalBlockMs = profileAgg.__total.total
+  const wallSec = windowMs / 1000
+  const blkPerSec = (blocks / wallSec).toFixed(2)
+  const avgBlockMs = (totalBlockMs / blocks).toFixed(1)
+
+  const ranked = PROFILE_PHASES
+    .map(p => ({ phase: p as PhaseKey, ...profileAgg[p] }))
+    .sort((a, b) => b.total - a.total)
+
+  console.log(`[profile] === ${blocks} blocks in ${wallSec.toFixed(1)}s wall — ${blkPerSec} blk/s aggregate, avg ${avgBlockMs}ms in-block (sum of phases ≠ wall clock due to parallelism across ${blocks > 0 ? 'workers' : '?'}) ===`)
+  for (const r of ranked) {
+    const pct = totalBlockMs > 0 ? (r.total / totalBlockMs * 100).toFixed(1) : '0.0'
+    const avg = r.count > 0 ? (r.total / r.count).toFixed(1) : '-'
+    const rowsPerBlk = r.count > 0 && r.rows > 0 ? `, ${(r.rows / r.count).toFixed(1)} rows/blk` : ''
+    console.log(`[profile]   ${r.phase.padEnd(26)} ${r.total.toFixed(0).padStart(7)}ms  ${pct.padStart(5)}%  avg ${avg}ms/blk (n=${r.count}${rowsPerBlk})`)
+  }
+}
+
+// ── Types ───────────────────────────────────────────────────────────
+export type NormalizedLog = {
+  address: string
+  topics: string[]
+  data: string
+  index: number
+}
+
+export type NormalizedReceipt = {
+  status: boolean
+  gasUsed: bigint
+  /**
+   * What the transaction actually paid per gas. `tx.gasPrice` is the type-2
+   * MAX fee on some nodes (and absent on others), so the receipt is the source of
+   * truth; absent here means the node did not report a parseable value.
+   */
+  effectiveGasPrice?: bigint
+  logs: NormalizedLog[]
+}
+
+type TokenTransferRow = {
+  txHash: string
+  logIndex: number
+  tokenAddress: string
+  fromAddress: string
+  toAddress: string
+  value: string
+  tokenId: string | null
+  blockNumber: number
+  timestamp: Date
+  tokenType: 'BEP20' | 'BEP721' | 'BEP1155'
+}
+
+type DexTradeRow = {
+  txHash: string
+  /**
+   * Position of the Swap log within the block. Together with blockNumber this is the
+   * event's natural key — the thing that makes a dex_trade re-insertable.
+   *
+   * Without it the table had only `id serial PRIMARY KEY`, so every row was
+   * unique by construction and onConflictDoNothing() could never match: replaying
+   * a block silently doubled its trades. That is why rpc-failover.ts refuses to
+   * fail over past the first write, and why the gap healer restricts itself to
+   * ABSENT blocks.
+   */
+  logIndex: number
+  dex: string
+  pairAddress: string
+  tokenIn: string
+  tokenOut: string
+  amountIn: string
+  amountOut: string
+  maker: string
+  blockNumber: number
+  timestamp: Date
+}
+
+// ── Caches ──────────────────────────────────────────────────────────
+const tokenCache = new Set<string>()
+const TOKEN_CACHE_MAX = 50_000
+
+// null: not a listed factory's pair (dex-swap.ts V2_FACTORIES), remembered so it is not re-read every block.
+const pairCache = new Map<string, V2Pair | null>()
+// Measures the post-write fan-out per block, to size its budgets (lib: fanout-stats.ts). Counts only.
+const fanoutStats = createFanoutStats()
+const PAIR_CACHE_MAX = 10_000
+// Post-write metadata reads in flight, across every block (post-write-budget.ts).
+const tokenReads = createLimiter(POST_WRITE_CONCURRENCY)
+const pairReads = createLimiter(POST_WRITE_CONCURRENCY)
+const readTimeoutMs = () => indexerConfig.rpc.readTimeoutMs
+
+// ── Main entry ──────────────────────────────────────────────────────
+/**
+ * `onWritesBegan` is invoked exactly once, immediately before the first durable
+ * write. Everything above that call is pure RPC acquisition and is safe to retry
+ * on another endpoint; everything below it persists incrementally, so another endpoint is not tried once writes
+ * began (a replay of the block repairs its missing rows instead: dex_trades dedupes on block_number, log_index). RPC
+ * failover uses this boundary — see rpc-failover.ts. Optional: callers that
+ * never retry (backfill.ts) can ignore it.
+ */
+/**
+ * Is this log index usable as part of a natural key?
+ *
+ * `NormalizedLog.index` is `parseInt(logIndex, 16)`, which yields NaN on a
+ * malformed or missing value. NaN cannot participate in a unique constraint
+ * (every NaN compares unequal), so admitting one silently restores the
+ * duplicate-on-replay bug for exactly the rows an odd endpoint returns.
+ */
+export function isUsableLogIndex(n: unknown): n is number {
+  return typeof n === 'number' && Number.isInteger(n) && n >= 0
+}
+
+/**
+ * Refuse a block whose receipt set does not cover all of its transactions.
+ *
+ * Every token_transfer and dex_trade is derived from receipts, and the transfer
+ * writer persists a block by DELETEing its rows and re-inserting whatever it was
+ * handed (writeTransferBlocks). So an under-covered receipt set does not merely
+ * under-report — on REPLAY it destroys rows that were previously correct, and
+ * the block still ends up carrying a full tx_count, which is precisely the shape
+ * every completeness check (including the gap healer's own verification) treats
+ * as healthy. That combination is what turns a visible gap into invisible bad
+ * data reporting `ok`.
+ *
+ * `eth_getBlockReceipts` is all-or-nothing — one receipt per transaction — so
+ * any other count means the endpoint returned a partial answer. Throwing hands
+ * the block back to rpc-failover for a retry elsewhere.
+ *
+ * Exported and pure so the invariant can be asserted directly; the shipped call
+ * site passes the same four values.
+ */
+export function assertReceiptCoverage(
+  blockNumber: number,
+  txHashes: readonly string[],
+  receiptHashes: readonly string[],
+  wantReceipts: boolean,
+): void {
+  // skipLogs deliberately fetches no receipts — an empty set is correct there,
+  // and processBlock already refuses to enqueue transfers in that mode.
+  if (!wantReceipts) return
+
+  // Matching COUNTS are not coverage. A response can return one receipt twice
+  // and omit another and still be the right length; receiptByTx would then
+  // overwrite the duplicate and silently supply default-success data for the
+  // transaction that never arrived. So compare the SETS, not the sizes.
+  const want = new Set(txHashes.map(h => h.toLowerCase()))
+  const got = new Set<string>()
+  for (const h of receiptHashes) {
+    const k = h.toLowerCase()
+    // A repeated hash means the response is malformed, or is a splice of two
+    // different versions of this block observed across a reorg.
+    if (got.has(k)) {
+      throw new Error(`Block ${blockNumber} receipt set invalid: duplicate receipt for ${k}`)
+    }
+    got.add(k)
+  }
+
+  // Checked in BOTH directions and without an early return for the empty block:
+  // receipts arriving for a block with no transactions means the endpoint
+  // answered about a DIFFERENT block, and attributing its derived rows here
+  // would be worse than missing them.
+  if (want.size !== got.size) {
+    throw new Error(
+      `Block ${blockNumber} receipt coverage incomplete: ${got.size} receipt(s) for ` +
+      `${want.size} transaction(s)`,
+    )
+  }
+  for (const h of want) {
+    if (!got.has(h)) {
+      throw new Error(`Block ${blockNumber} receipt coverage incomplete: no receipt for ${h}`)
+    }
+  }
+}
+
+// Internal-transaction failures are reported, never thrown: the trace endpoint is
+// a second provider that is not in the failover pool, so a throw would retry the
+// same dead endpoint from every block provider and stall indexing for a secondary
+// table. First failure reports immediately; then at most once a minute with the
+// count accumulated since, so a sick endpoint cannot bury the progress line.
+let itxProblemsSinceReport = 0
+let itxLastReportAt = 0
+function reportInternalTxProblem(phase: 'trace' | 'insert', blockNumber: number, err: unknown): void {
+  itxProblemsSinceReport++
+  const now = Date.now()
+  if (itxLastReportAt !== 0 && now - itxLastReportAt < 60_000) return
+  console.warn(`[internal-tx] ${phase} failed at block ${blockNumber} (${itxProblemsSinceReport} since last report): ${safeRpcError(err)}`)
+  itxProblemsSinceReport = 0
+  itxLastReportAt = now
+}
+
+/**
+ * A trace gets its own deadline, inside the block's acquisition timeout. It used to
+ * share that timeout, and because the trace endpoint is not in the failover pool, one
+ * that stopped answering failed every block on every block endpoint until the poison
+ * tracker quarantined them. 60% leaves the block and receipt fetches the rest.
+ */
+export const TRACE_DEADLINE_MS = Math.floor(RPC_FETCH_TIMEOUT_MS * 0.6)
+
+/**
+ * Nothing cancels an abandoned trace call. withTimeout only stops waiting, and on Node
+ * ethers' own timeout neither destroys the socket nor aborts it, which is also why it
+ * is not used here: it would let a timed-out socket escape this count. So the count
+ * covers the whole call, including ethers' internal retries, until it settles.
+ * Two per worker allows the normal call plus one abandoned one.
+ */
+export const TRACE_MAX_IN_FLIGHT = 2 * indexerConfig.indexing.concurrency
+let traceCallsInFlight = 0
+export function tracesInFlight(): number { return traceCallsInFlight }
+
+/**
+ * Trace a block within the deadline and the in-flight cap. Never throws: null means
+ * the block is stored without internal transactions, and the reason is reported.
+ */
+export async function traceWithinBudget(
+  provider: JsonRpcProvider,
+  blockNumber: number,
+  { deadlineMs = TRACE_DEADLINE_MS, maxInFlight = TRACE_MAX_IN_FLIGHT } = {},
+): Promise<RawTraceTx[] | null> {
+  if (traceCallsInFlight >= maxInFlight) {
+    reportInternalTxProblem('trace', blockNumber, new Error(`not started: ${traceCallsInFlight} trace calls still in flight (cap ${maxInFlight})`))
+    return null
+  }
+  traceCallsInFlight++
+  const call = fetchBlockTraces(provider, blockNumber).finally(() => { traceCallsInFlight-- })
+  try {
+    return await withTimeout(call, deadlineMs, `block ${blockNumber} trace`)
+  } catch (err) {
+    reportInternalTxProblem('trace', blockNumber, err)
+    return null
+  }
+}
+
+/** Decode a block's traces and report what the decoder refused. Null: nothing usable. */
+function decodeTraces(raw: readonly RawTraceTx[], blockNumber: number, timestamp: Date, txHashes: readonly string[]): InternalTxRow[] | null {
+  const prepared = prepareInternalTxRows(raw, blockNumber, timestamp, txHashes)
+  if (prepared.problem) {
+    reportInternalTxProblem('trace', blockNumber, prepared.problem)
+    return null
+  }
+  if (prepared.dropped > 0) {
+    reportInternalTxProblem('trace', blockNumber, new Error(`${prepared.dropped} trace entr(ies) do not belong to the block, dropped`))
+  }
+  if (prepared.overlong > 0) {
+    reportInternalTxProblem('trace', blockNumber, new Error(`${prepared.overlong} frame(s) nested too deep to store (trace address over ${MAX_TRACE_ADDRESS_LEN} characters), skipped`))
+  }
+  return prepared.rows
+}
+
+/** Natural key + ON CONFLICT DO NOTHING, so a replay or a re-trace never duplicates. Never throws. */
+async function insertInternalTxRows(db: ReturnType<typeof getDb>, rows: InternalTxRow[], blockNumber: number): Promise<boolean> {
+  for (let i = 0; i < rows.length; i += SQL_BATCH_CHUNK) {
+    try {
+      await db.insert(schema.internalTransactions).values(rows.slice(i, i + SQL_BATCH_CHUNK)).onConflictDoNothing()
+    } catch (err) {
+      reportInternalTxProblem('insert', blockNumber, err)
+      return false
+    }
+  }
+  return true
+}
+
+/**
+ * A block stored without internal transactions because its trace failed gets a few
+ * more tries, a few blocks later: a trace node a block or two behind the tip says
+ * "not found" for the newest block and has it moments later. The main loop drives it
+ * (retraceMissedBlocks) and never waits on it, so indexing stays decoupled from the
+ * trace service.
+ *
+ * Bounded three ways: at most RETRACE_BACKLOG_MAX blocks (the oldest goes first), at
+ * most RETRACE_MAX_ATTEMPTS re-traces each (RETRACE_AFTER_BLOCKS, then doubling), and
+ * only while the block is within INTERNAL_TX_MAX_LAG of the tip, the same window the
+ * first trace uses.
+ *
+ * In memory only: a restart drops it, and those blocks keep no internal transactions.
+ * The shutdown line counts them.
+ */
+export const RETRACE_AFTER_BLOCKS = 4
+export const RETRACE_MAX_ATTEMPTS = 4
+export const RETRACE_BACKLOG_MAX = 256
+/** Re-traces start only while this many trace calls or fewer are open: the spare half of the cap. */
+export const RETRACE_MAX_IN_FLIGHT = indexerConfig.indexing.concurrency
+
+type TraceMiss = { timestamp: Date; txHashes: string[]; attempts: number; dueAt: number; tracing: boolean }
+const traceMisses = new Map<number, TraceMiss>()
+const retraces = new Set<Promise<void>>()
+let retracesRecovered = 0
+let retracesDropped = 0
+
+function dropTraceMiss(blockNumber: number, why: string): void {
+  // Already gone means a reorg unwind forgot it mid-retrace: nothing to count.
+  if (!traceMisses.delete(blockNumber)) return
+  retracesDropped++
+  reportInternalTxProblem('trace', blockNumber, new Error(`re-trace abandoned (${why}); the block keeps no internal transactions`))
+}
+
+function noteTraceMiss(blockNumber: number, timestamp: Date, txHashes: string[]): void {
+  if (!traceMisses.has(blockNumber) && traceMisses.size >= RETRACE_BACKLOG_MAX) {
+    // Map order is insertion order, so the first key is the block that missed first.
+    dropTraceMiss(traceMisses.keys().next().value as number, `backlog full at ${RETRACE_BACKLOG_MAX}`)
+  }
+  traceMisses.set(blockNumber, { timestamp, txHashes, attempts: 0, dueAt: blockNumber + RETRACE_AFTER_BLOCKS, tracing: false })
+}
+
+async function retrace(provider: JsonRpcProvider, blockNumber: number, miss: TraceMiss): Promise<void> {
+  const raw = await traceWithinBudget(provider, blockNumber, { maxInFlight: RETRACE_MAX_IN_FLIGHT })
+  // A reorg unwind forgot this block while the trace was open: its rows are not wanted.
+  if (traceMisses.get(blockNumber) !== miss) return
+  if (raw) {
+    const rows = decodeTraces(raw, blockNumber, miss.timestamp, miss.txHashes)
+    if (rows === null) return dropTraceMiss(blockNumber, 'traces did not decode')
+    if (await insertInternalTxRows(getDb(), rows, blockNumber)) {
+      traceMisses.delete(blockNumber)
+      retracesRecovered++
+      return
+    }
+  }
+  miss.attempts++
+  if (miss.attempts >= RETRACE_MAX_ATTEMPTS) return dropTraceMiss(blockNumber, `${miss.attempts} re-traces failed`)
+  miss.dueAt = blockNumber + (RETRACE_AFTER_BLOCKS << miss.attempts)
+}
+
+/**
+ * Called once per main-loop batch with the tip just read. Starts the due re-traces in
+ * the background and returns at once; never throws.
+ */
+export function retraceMissedBlocks(provider: JsonRpcProvider, latest: number, maxLag: number): void {
+  for (const [blockNumber, miss] of traceMisses) {
+    if (miss.tracing) continue
+    if (latest - blockNumber > maxLag) { dropTraceMiss(blockNumber, `more than ${maxLag} blocks behind the tip`); continue }
+    if (latest < miss.dueAt || tracesInFlight() >= RETRACE_MAX_IN_FLIGHT) continue
+    // Held until the whole retrace ends, insert included: a slow insert must not let
+    // the next batch start the same block again, outside the cap and the attempt count.
+    miss.tracing = true
+    const task = retrace(provider, blockNumber, miss).finally(() => { miss.tracing = false; retraces.delete(task) })
+    retraces.add(task)
+  }
+}
+
+/**
+ * Before a reorg unwind: wait for open re-traces, so none inserts rows after the
+ * unwind's delete, and forget the blocks the unwind removes. The re-index traces
+ * them again.
+ */
+export async function forgetTraceMissesFrom(fromBlock: number): Promise<void> {
+  for (const blockNumber of [...traceMisses.keys()]) if (blockNumber >= fromBlock) traceMisses.delete(blockNumber)
+  await Promise.all([...retraces])
+}
+
+export function retraceBacklogStats(): { pending: number; recovered: number; dropped: number } {
+  return { pending: traceMisses.size, recovered: retracesRecovered, dropped: retracesDropped }
+}
+
+export async function processBlock(
+  blockNumber: number,
+  provider: JsonRpcProvider,
+  skipLogs = false,
+  onWritesBegan?: () => void,
+  /** When given, the block is traced on THIS provider and its internal transactions stored. */
+  traceProvider: JsonRpcProvider | null = null,
+) {
+  const t: PhaseTimings | null = PROFILE_ENABLED ? newTimings() : null
+  const blockStart = PROFILE_ENABLED ? performance.now() : 0
+  const db = getDb()
+
+  // Fire both RPC calls in parallel and await both up-front so we can merge
+  // receipt data (status, gasUsed) directly into the tx INSERT — avoids a
+  // second UPDATE round-trip that previously ran against freshly-inserted
+  // rows and caused row-lock contention across 8 concurrent block workers.
+  const wantReceipts = !skipLogs
+  const rpcStart = PROFILE_ENABLED ? performance.now() : 0
+  const blockPromise = provider.getBlock(blockNumber, true)
+  const receiptsPromise = wantReceipts
+    ? fetchBlockReceipts(provider, blockNumber)
+    : Promise.resolve([] as Array<{ txHash: string; receipt: NormalizedReceipt }>)
+
+  // Bound the acquisition. An archive-refusing or throttled endpoint does NOT
+  // fail fast — bsc.publicnode.com took ~85-90s to reject an archive request,
+  // and since a failed attempt never reaches recordTimings, that wait was
+  // invisible to the profiler while stalling the batch. 7 such failures lined up
+  // 1:1 with 7 >60s stall windows.
+  //
+  // Placed HERE, strictly above the first write (onWritesBegan below), so a
+  // timeout can only ever abandon pure reads — rpc-failover then retries the
+  // block on another endpoint with no risk of a half-written replay.
+  // Traces ride in the same pure-read phase, in parallel (measured 0.6-0.8s median
+  // per block on both chains), under their own shorter deadline and an in-flight
+  // cap. Soft: a failure, a timeout or a full cap yields null and is reported, so
+  // the block still lands. See traceWithinBudget.
+  const tracesPromise: Promise<RawTraceTx[] | null> = traceProvider
+    ? traceWithinBudget(traceProvider, blockNumber)
+    : Promise.resolve(null)
+  const [block, receipts, rawTraces] = await withTimeout(
+    Promise.all([blockPromise, receiptsPromise, tracesPromise]),
+    RPC_FETCH_TIMEOUT_MS,
+    `block ${blockNumber} acquisition`,
+  )
+  if (t) {
+    t.rpcBlockWait = performance.now() - rpcStart
+    t.rpcReceiptsWait = 0
+  }
+  if (!block) throw new Error(`Block ${blockNumber} not found`)
+  if (!block.hash) throw new Error(`Block ${blockNumber} has no hash (pending block?)`)
+  // An endpoint that answers a DIFFERENT height must not be believed: the async
+  // transfer writer DELETEs the rows of the block number it is handed and then
+  // inserts what it decoded, so a block N+1 response processed as N would wipe
+  // N+1's transfers and label them N. Strictly above the first write, so
+  // rpc-failover retries the block on another endpoint.
+  if (block.number !== blockNumber) {
+    throw new Error(`Block ${blockNumber} response is for height ${block.number}`)
+  }
+
+  // Refuse a partially-covered block BEFORE the first write, so rpc-failover can
+  // retry it on another endpoint with nothing half-written. See the function.
+  assertReceiptCoverage(
+    blockNumber,
+    block.prefetchedTransactions.map(tx => tx.hash),
+    receipts.map(r => r.txHash),
+    wantReceipts,
+  )
+
+  const timestamp = new Date(Number(block.timestamp) * 1000)
+
+  // Decode the traces HERE, above the first write: the decoder walks untrusted
+  // JSON and used to run after the block insert with nothing around it, so one
+  // malformed frame threw with the block half-persisted (pinning the cursor and
+  // blocking quarantine). It is also where traces for transactions that are not
+  // in this block are dropped. Never throws — see prepareInternalTxRows.
+  const itxRows = rawTraces
+    ? decodeTraces(rawTraces, blockNumber, timestamp, block.prefetchedTransactions.map(tx => tx.hash)) ?? []
+    : []
+
+  // Map tx hash → receipt so we can populate tx.status / tx.gasUsed at INSERT
+  // time instead of via a follow-up UPDATE pass.
+  // Keyed lowercase on both sides — see fetchBlockReceipts. Defensive even though
+  // the fetch normalizes, because this map is what silently substitutes default
+  // receipt data on a miss.
+  const receiptByTx = new Map<string, NormalizedReceipt>()
+  for (const r of receipts) receiptByTx.set(r.txHash.toLowerCase(), r.receipt)
+
+  // ── 1. Insert block ────────────────────────────────────────────
+  // Point of no return: past here the block is partially persisted, so this
+  // attempt can no longer be replayed on a different endpoint.
+  onWritesBegan?.()
+  const s1 = PROFILE_ENABLED ? performance.now() : 0
+  await db.insert(schema.blocks).values({
+    number: block.number,
+    hash: block.hash,
+    parentHash: block.parentHash,
+    timestamp,
+    miner: block.miner.toLowerCase(),
+    gasUsed: block.gasUsed,
+    gasLimit: block.gasLimit,
+    baseFeePerGas: block.baseFeePerGas?.toString() ?? null,
+    txCount: block.transactions.length,
+    size: 0,
+  }).onConflictDoNothing()
+  if (t) t.dbInsertBlock = performance.now() - s1
+
+  // ── 2. Bulk insert transactions (with receipt data baked in) ───
+  const txValues = block.prefetchedTransactions.map((tx, idx) => {
+    const rec = receiptByTx.get(tx.hash.toLowerCase())
+    return {
+      hash: tx.hash,
+      blockNumber: block.number,
+      fromAddress: tx.from.toLowerCase(),
+      toAddress: tx.to?.toLowerCase() ?? null,
+      value: tx.value.toString(),
+      gas: tx.gasLimit,
+      gasPrice: rec?.effectiveGasPrice?.toString() ?? tx.gasPrice?.toString() ?? '0',
+      gasUsed: rec?.gasUsed ?? 0n,
+      input: tx.data.length > 500 ? tx.data.slice(0, 500) : tx.data,
+      // `rec` is absent only under skipLogs (no receipts fetched); a fetched receipt
+      // always carries a proven status — see parseReceiptStatus.
+      status: rec?.status ?? true,
+      methodId: tx.data.length >= 10 ? tx.data.slice(0, 10) : null,
+      txIndex: idx,
+      nonce: tx.nonce,
+      txType: tx.type ?? 0,
+      timestamp,
+    }
+  })
+  if (t) t.txCount = txValues.length
+
+  let insertedAddrs: Array<{ fromAddress: string; toAddress: string | null }> = []
+  if (txValues.length > 0) {
+    const s2 = PROFILE_ENABLED ? performance.now() : 0
+    insertedAddrs = await db.insert(schema.transactions)
+      .values(txValues)
+      .onConflictDoNothing()
+      .returning({
+        fromAddress: schema.transactions.fromAddress,
+        toAddress: schema.transactions.toAddress,
+      })
+    if (t) t.dbInsertTxs = performance.now() - s2
+
+    if (insertedAddrs.length > 0) {
+      // Fire-and-forget coalesced flush — see enqueueAddressActivity below.
+      // Keeps hot-path block time bounded; the `addresses` table is metadata
+      // (tx_count / last_seen), eventual consistency across a few seconds is fine.
+      enqueueAddressActivity(insertedAddrs, timestamp)
+    }
+  }
+
+  // ── 2b. Internal transactions (traces already awaited and decoded above) ───
+  // Natural key (block_number, tx_hash, trace_address) + onConflictDoNothing:
+  // a replay is a no-op, never a duplicate. Degrades rather than throws — writes
+  // have begun, and a throw here would hand a partially persisted block to the
+  // poison path over a secondary table.
+  await insertInternalTxRows(db, itxRows, blockNumber)
+  // A failed trace (not an empty one) gets a few more tries in the background.
+  if (traceProvider && rawTraces === null) {
+    noteTraceMiss(blockNumber, timestamp, block.prefetchedTransactions.map(tx => tx.hash))
+  }
+
+  // ── 3. Decode receipts (already awaited above) ─────────────────
+  let decodedTransfers: TokenTransferRow[] = []
+  if (wantReceipts && block.prefetchedTransactions.length > 0 && receipts.length > 0) {
+    decodedTransfers = await processReceiptsBatch(receipts, blockNumber, timestamp, provider, t)
+  }
+
+  // ── 3b. Async transfer-writer enqueue ──────────────────────────
+  // Hand decoded transfers to the single coalescing writer. Enqueue EVERY block —
+  // including transfer-less ones (empty array) — so the durable watermark can
+  // advance past it. The writer persists these rows and only then advances
+  // indexer_cursor.transfers_durable_block, the crash-safe resume point.
+  //
+  // EXCEPT when skipLogs: receipts weren't decoded, so decodedTransfers is empty
+  // by-omission, not empty-by-fact. The writer would DELETE the block's existing
+  // token_transfers (writeTransferBlocks always DELETEs the drained blocks) and
+  // re-insert nothing — silent data loss for `--skip-logs` backfills such as the
+  // documented `backfill.js 1 N --skip-logs`. The live indexer never sets skipLogs,
+  // so its watermark-advance behavior (transfer-less blocks still enqueue []) is
+  // unchanged.
+  if (ASYNC_TT_WRITER && !skipLogs) {
+    enqueueTransferWrite(block.number, decodedTransfers)
+  }
+
+  // ── 4. Webhooks (non-blocking) ─────────────────────────────────
+  if (!skipLogs && txValues.length > 0) {
+    notifyWebhooks(
+      txValues.map(tx => ({ hash: tx.hash, fromAddress: tx.fromAddress, toAddress: tx.toAddress ?? null, value: tx.value })),
+      block.number,
+      timestamp,
+      block.hash,
+    ).catch(err => console.error('[webhook-notifier] delivery error:', unwrapDbError(err)))
+  }
+
+  if (t) {
+    t.totalMs = performance.now() - blockStart
+    recordTimings(t)
+  }
+}
+
+// ── Receipt batch processing ────────────────────────────────────────
+/**
+ * Decode receipt logs for a block into token_transfers and dex_trades.
+ * Tx status / gasUsed are populated at INSERT time in processBlock, so this
+ * function no longer runs a separate UPDATE pass.
+ */
+async function processReceiptsBatch(
+  receipts: Array<{ txHash: string; receipt: NormalizedReceipt }>,
+  blockNumber: number,
+  timestamp: Date,
+  provider: JsonRpcProvider,
+  t: PhaseTimings | null = null,
+): Promise<TokenTransferRow[]> {
+  const db = getDb()
+
+  // Decoded transfer rows for this block. In async mode these are returned to the
+  // caller to enqueue on the writer instead of being INSERTed inline here.
+  let decodedTransfers: TokenTransferRow[] = []
+  const fanout = { tokens: 0, pairs: 0, pairDrops: 0 }
+
+  // Note: tx.status / tx.gasUsed are now populated at INSERT time in processBlock
+  // (receipts awaited up-front and merged into txValues). No second UPDATE pass.
+  if (t) t.dbUpdateTxStatus = 0
+
+  // ── B. Pre-filter logs by topic ─────────────────────────────────
+  const transferLogs: Array<{ txHash: string; log: NormalizedLog }> = []
+  const dexSwapLogs: Array<{ txHash: string; log: NormalizedLog }> = []
+
+  for (const { txHash, receipt } of receipts) {
+    for (const log of receipt.logs) {
+      const topic0 = log.topics[0]
+      if (topic0 === TRANSFER_TOPIC || topic0 === TRANSFER_SINGLE_TOPIC) {
+        transferLogs.push({ txHash, log })
+      } else if (topic0 === SWAP_V2_TOPIC) {
+        dexSwapLogs.push({ txHash, log })
+      }
+    }
+  }
+
+  // ── C. Decode & bulk-insert token transfers ─────────────────────
+  if (transferLogs.length > 0) {
+    const rows: TokenTransferRow[] = []
+    const tokensToEnsure = new Map<string, 'BEP20' | 'BEP721' | 'BEP1155'>()
+
+    for (const { txHash, log } of transferLogs) {
+      try {
+        const topic0 = log.topics[0]
+        let from: string, to: string, value: bigint, tokenId: bigint | null = null
+        let tokenType: 'BEP20' | 'BEP721' | 'BEP1155'
+
+        if (topic0 === TRANSFER_TOPIC && log.topics.length === 3) {
+          tokenType = 'BEP20'
+          from = '0x' + log.topics[1].slice(26)
+          to = '0x' + log.topics[2].slice(26)
+          value = abi.decode(['uint256'], log.data)[0] as bigint
+        } else if (topic0 === TRANSFER_TOPIC && log.topics.length === 4) {
+          tokenType = 'BEP721'
+          from = '0x' + log.topics[1].slice(26)
+          to = '0x' + log.topics[2].slice(26)
+          tokenId = BigInt(log.topics[3])
+          value = 1n
+        } else if (topic0 === TRANSFER_SINGLE_TOPIC) {
+          tokenType = 'BEP1155'
+          from = '0x' + log.topics[2].slice(26)
+          to = '0x' + log.topics[3].slice(26)
+          const decoded = abi.decode(['uint256', 'uint256'], log.data)
+          tokenId = decoded[0] as bigint
+          value = decoded[1] as bigint
+        } else {
+          continue
+        }
+
+        const tokenAddress = log.address.toLowerCase()
+        rows.push({
+          txHash,
+          logIndex: log.index,
+          tokenAddress,
+          fromAddress: from.toLowerCase(),
+          toAddress: to.toLowerCase(),
+          value: value.toString(),
+          tokenId: tokenId?.toString() ?? null,
+          blockNumber,
+          timestamp,
+          tokenType,
+        })
+
+        if (!tokenCache.has(tokenAddress) && !tokensToEnsure.has(tokenAddress)) {
+          tokensToEnsure.set(tokenAddress, tokenType)
+        }
+      } catch {
+        // Skip malformed logs
+      }
+    }
+
+    if (t) t.transferCount = rows.length
+
+    // Ensure unknown tokens exist (batched RPC lookups)
+    if (tokensToEnsure.size > 0) {
+      const sT = PROFILE_ENABLED ? performance.now() : 0
+      fanout.tokens = await ensureTokensBatch(tokensToEnsure, provider)
+      if (t) t.rpcEnsureTokens = performance.now() - sT
+    }
+
+    // Token transfer persistence. In async mode the rows are returned to the
+    // caller and written by the single coalescing writer (removing the 8-worker
+    // index contention that made this ~50% of BNB block time). In sync mode
+    // (ETH / ASYNC_TT_WRITER=0) they are INSERTed inline exactly as before.
+    if (rows.length > 0) {
+      if (ASYNC_TT_WRITER) {
+        decodedTransfers = rows
+        // dbInsertTokenTransfers intentionally stays ~0 here — the write happens
+        // off the hot path in the writer; t.transferCount above still records volume.
+      } else {
+        // Bulk insert token transfers — chunked to avoid stack overflow in Drizzle
+        const sI = PROFILE_ENABLED ? performance.now() : 0
+        let totalInserted = 0
+        for (let i = 0; i < rows.length; i += SQL_BATCH_CHUNK) {
+          const chunk = rows.slice(i, i + SQL_BATCH_CHUNK)
+          const inserted = await db.insert(schema.tokenTransfers)
+            .values(chunk.map(r => ({
+              txHash: r.txHash,
+              logIndex: r.logIndex,
+              tokenAddress: r.tokenAddress,
+              fromAddress: r.fromAddress,
+              toAddress: r.toAddress,
+              value: r.value,
+              tokenId: r.tokenId,
+              blockNumber: r.blockNumber,
+              timestamp: r.timestamp,
+            })))
+            .onConflictDoNothing()
+            // Count inserted rows only (gates the holder-balance enqueue below). We
+            // return block_number (NOT NULL) purely so `.length` is correct — there is
+            // no `id` column anymore (dropped 2026-06-20 after int4 seq overflow).
+            .returning({ b: schema.tokenTransfers.blockNumber })
+          totalInserted += inserted.length
+        }
+        if (t) t.dbInsertTokenTransfers = performance.now() - sI
+
+        // Holder balance updates are queued for a single dedicated worker.
+        // Profiling showed inline UPSERTs took ~38% of in-block time (~2.5s/block)
+        // due to row-lock contention across 8 workers hammering the same hot tokens.
+        // Serializing through one worker eliminates cross-worker contention and
+        // unblocks block processing. Eventually consistent — queue drains during
+        // low-activity windows. Order doesn't matter (addition is commutative).
+        if (totalInserted > 0) {
+          const sH = PROFILE_ENABLED ? performance.now() : 0
+          enqueueHolderBalanceUpdate(rows)
+          if (t) t.dbUpdateHolderBalances = performance.now() - sH
+        }
+      }
+    }
+  }
+
+  // ── D. Decode & bulk-insert DEX trades ──────────────────────────
+  if (dexSwapLogs.length > 0) {
+    const dexRows: DexTradeRow[] = []
+
+    // Collect unknown pairs and fetch their tokens in parallel
+    const unknownPairs = new Set<string>()
+    for (const { log } of dexSwapLogs) {
+      const pairAddress = log.address.toLowerCase()
+      if (!pairCache.has(pairAddress)) unknownPairs.add(pairAddress)
+    }
+    fanout.pairs = unknownPairs.size
+    if (unknownPairs.size > 0) {
+      const sP = PROFILE_ENABLED ? performance.now() : 0
+      // Past the budget a pair is not read, and its swaps are dropped below and counted (fanout-stats.ts): a stated loss.
+      const { now: resolveNow, over } = withinBudget(Array.from(unknownPairs), PAIR_RESOLVE_PER_BLOCK)
+      if (over.length > 0) console.warn(`[dex] pair budget exceeded in block ${blockNumber}: ${over.length} of ${unknownPairs.size} unknown pairs not read`)
+      // A read that times out is a failed read: nothing is cached, and the pair is read again when it next swaps.
+      await Promise.all(resolveNow.map(pair =>
+        boundedRead(pairReads, () => fetchPairTokens(pair, provider), readTimeoutMs(), `pair ${pair}`).catch(() => {})))
+      if (t) t.rpcPairTokens = performance.now() - sP
+    }
+
+    for (const { txHash, log } of dexSwapLogs) {
+      try {
+        // log_index is the natural key now, so an unusable one is not cosmetic.
+        if (!isUsableLogIndex(log.index)) continue
+        const pairAddress = log.address.toLowerCase()
+        const pair = pairCache.get(pairAddress)
+        if (!pair) {
+          // Not in the cache at all: its read failed, so this trade is dropped. A cached null is "not a pair".
+          if (!pairCache.has(pairAddress)) fanout.pairDrops++
+          continue
+        }
+
+        const swap = decodeV2Swap(log, pair.tokens)
+        if (!swap) continue
+
+        dexRows.push({
+          txHash,
+          logIndex: log.index,
+          dex: pair.dex,
+          pairAddress,
+          ...swap,
+          blockNumber,
+          timestamp,
+        })
+      } catch {
+        // Skip malformed swaps
+      }
+    }
+
+    if (t) t.dexCount = dexRows.length
+    if (dexRows.length > 0) {
+      const sD = PROFILE_ENABLED ? performance.now() : 0
+      for (let i = 0; i < dexRows.length; i += SQL_BATCH_CHUNK) {
+        await db.insert(schema.dexTrades).values(dexRows.slice(i, i + SQL_BATCH_CHUNK)).onConflictDoNothing()
+      }
+      if (t) t.dbInsertDexTrades = performance.now() - sD
+    }
+  }
+
+  fanoutStats.record(fanout)
+  return decodedTransfers
+}
+
+// ── Async addresses coalescer ───────────────────────────────────────
+/**
+ * Accumulates address activity (tx_count delta + last_seen) across blocks
+ * and flushes in coalesced batches. Previously the upsert ran synchronously
+ * per block and was the dominant lock-contention source under 8-worker
+ * concurrency — hot rows (WBNB, PancakeSwap router, stablecoins) serialized
+ * on row locks, and deadlock retries added 50-150ms stalls to random blocks.
+ *
+ * Coalescing properties:
+ *   - Larger batches → fewer lock acquisition cycles overall
+ *   - Single in-flight flush → bounded memory and DB pool pressure
+ *   - Deduplicated addresses → one row lock per distinct address per flush
+ *   - Fire-and-forget from block loop → block processing never waits on
+ *     addresses-table contention
+ *
+ * The addresses table is metadata (tx_count, last_seen). Eventual consistency
+ * across a few seconds is acceptable; firstSeen still populates correctly
+ * via the INSERT clause of ON CONFLICT.
+ */
+type AddressPending = { count: number; ts: Date }
+let addressPending = new Map<string, AddressPending>()
+let addressFlushInflight: Promise<void> | null = null
+
+function enqueueAddressActivity(
+  txs: Array<{ fromAddress: string; toAddress: string | null }>,
+  timestamp: Date,
+): void {
+  const bump = (addr: string) => {
+    const prev = addressPending.get(addr)
+    if (prev) {
+      prev.count += 1
+      if (timestamp > prev.ts) prev.ts = timestamp
+    } else {
+      addressPending.set(addr, { count: 1, ts: timestamp })
+    }
+  }
+  for (const tx of txs) {
+    bump(tx.fromAddress)
+    if (tx.toAddress) bump(tx.toAddress)
+  }
+  kickAddressFlush()
+}
+
+function kickAddressFlush(): void {
+  if (addressFlushInflight) return
+  if (addressPending.size === 0) return
+  const snapshot = addressPending
+  addressPending = new Map()
+  addressFlushInflight = flushAddresses(snapshot)
+    .catch(err => console.warn('[addresses] flush failed:', dbErrorMessage(err)))
+    .finally(() => {
+      addressFlushInflight = null
+      if (addressPending.size > 0) kickAddressFlush()
+    })
+}
+
+/**
+ * Postgres aborted this statement to break a deadlock. The three batched upserts
+ * below retry it: lock ordering removes same-statement cycles, but a concurrent
+ * writer on another path can still collide.
+ */
+export function isDeadlock(err: unknown): boolean {
+  return dbErrorMessage(err).includes('deadlock')
+}
+
+async function flushAddresses(pending: Map<string, AddressPending>): Promise<void> {
+  const db = getDb()
+  // Sort by address → consistent lock order, minimizes deadlocks across flushes.
+  const entries = Array.from(pending.entries()).sort((a, b) => a[0].localeCompare(b[0]))
+
+  for (let i = 0; i < entries.length; i += SQL_BATCH_CHUNK) {
+    const chunk = entries.slice(i, i + SQL_BATCH_CHUNK)
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        await db.execute(sql`
+          INSERT INTO addresses (address, tx_count, first_seen, last_seen)
+          VALUES ${sql.join(
+            chunk.map(([addr, d]) =>
+              sql`(${addr}, ${d.count}, ${d.ts.toISOString()}::timestamptz, ${d.ts.toISOString()}::timestamptz)`,
+            ),
+            sql`, `,
+          )}
+          ON CONFLICT (address) DO UPDATE SET
+            tx_count  = addresses.tx_count + EXCLUDED.tx_count,
+            last_seen = GREATEST(addresses.last_seen, EXCLUDED.last_seen)
+        `)
+        break
+      } catch (err) {
+        if (isDeadlock(err) && attempt < 3) {
+          await new Promise(r => setTimeout(r, 50 * attempt))
+          continue
+        }
+        throw err
+      }
+    }
+  }
+}
+
+// ── Batched holder balance update ───────────────────────────────────
+/**
+ * Aggregate per-(token, holder) deltas across all transfers in the block,
+ * then apply a single batched upsert to token_balances.
+ *
+ * Previously this also maintained tokens.holder_count inline via a
+ * two-phase CTE (old_state → upsert → aggregate). Under production load
+ * on ETH (1000+ deltas per block) that CTE became the dominant bottleneck,
+ * scaling negatively with concurrency because of row-lock contention and
+ * deadlocks. holder_count is now recomputed periodically by the retention
+ * job instead — see recomputeHolderCounts().
+ */
+// ── Holder balance async queue ──────────────────────────────────────
+// Single-worker drainer for balance UPSERTs. Blocks previously awaited
+// this inline, which was the dominant per-block cost (~38% / ~2.5s).
+// Serializing through one worker removes cross-worker row-lock contention.
+const HOLDER_QUEUE_WARN_DEPTH = indexerConfig.holders.queueWarnDepth
+const SKIP_HOLDER_BALANCES = !indexerConfig.holderBalanceTrackingEnabled
+// The flag itself moved to config.ts. retention-cleanup.ts reads it, and it was
+// importing this 1,833-line module — and running its module side effects,
+// including the console.warn below — to get one boolean.
+console.warn('[holder-queue] HARDCODED SKIP — token_balances writes DISABLED to save DB from write storm')
+const holderQueue: TokenTransferRow[][] = []
+let holderWorkerRunning = false
+let holderQueueLogCounter = 0
+
+function enqueueHolderBalanceUpdate(rows: TokenTransferRow[]): void {
+  if (SKIP_HOLDER_BALANCES) return
+  holderQueue.push(rows)
+  if (++holderQueueLogCounter >= 100) {
+    holderQueueLogCounter = 0
+    if (holderQueue.length >= HOLDER_QUEUE_WARN_DEPTH) {
+      console.warn(`[holder-queue] depth=${holderQueue.length} batches (warn threshold ${HOLDER_QUEUE_WARN_DEPTH})`)
+    } else {
+      console.log(`[holder-queue] depth=${holderQueue.length} batches`)
+    }
+  }
+  runHolderWorker()
+}
+
+function runHolderWorker(): void {
+  if (holderWorkerRunning) return
+  holderWorkerRunning = true
+  // Fire-and-forget; errors logged per-drain, loop continues.
+  // Each drain coalesces the ENTIRE current queue into one merged UPSERT:
+  // delta aggregation is commutative, so N batches of deltas can be summed
+  // per (token, holder) and applied as a single SQL round-trip. This
+  // amortizes per-statement overhead — a queue of 500 batches drains in
+  // roughly the same time as 1, bounded only by the merged row count.
+  ;(async () => {
+    try {
+      while (holderQueue.length > 0) {
+        const drained = holderQueue.splice(0, holderQueue.length)
+        const merged: TokenTransferRow[] = []
+        for (const batch of drained) {
+          for (const r of batch) merged.push(r)
+        }
+        try {
+          await batchUpdateHolderBalances(merged)
+        } catch (err) {
+          console.warn(`[holder-queue] merged batch of ${drained.length} failed:`, dbErrorMessage(err))
+        }
+      }
+    } finally {
+      holderWorkerRunning = false
+    }
+  })()
+}
+
+export function getHolderQueueDepth(): number {
+  return holderQueue.length
+}
+
+async function batchUpdateHolderBalances(rows: TokenTransferRow[]): Promise<void> {
+  const db = getDb()
+
+  // Aggregate net deltas: (token, holder) → bigint
+  const deltas = new Map<string, bigint>()
+  const key = (token: string, holder: string) => `${token}|${holder}`
+
+  for (const r of rows) {
+    // Skip NFT holder tracking — BEP721/1155 balances aren't aggregated the same way
+    if (r.tokenType !== 'BEP20') continue
+
+    const v = BigInt(r.value)
+    if (r.toAddress !== ZERO_ADDRESS) {
+      const k = key(r.tokenAddress, r.toAddress)
+      deltas.set(k, (deltas.get(k) ?? 0n) + v)
+    }
+    if (r.fromAddress !== ZERO_ADDRESS) {
+      const k = key(r.tokenAddress, r.fromAddress)
+      deltas.set(k, (deltas.get(k) ?? 0n) - v)
+    }
+  }
+
+  if (deltas.size === 0) return
+
+  // Sort by (token, holder) so row locks are acquired in a consistent order,
+  // reducing (but not eliminating) deadlocks under concurrent block processors.
+  const entries = Array.from(deltas.entries())
+    .map(([k, delta]) => {
+      const [token, holder] = k.split('|')
+      return { token, holder, delta }
+    })
+    .sort((a, b) => (a.token + a.holder).localeCompare(b.token + b.holder))
+
+  // Simple upsert, with deadlock retry. No CTE, no holder_count tracking.
+  // Chunked to avoid V8 call stack overflow in Drizzle's sql.join() recursion.
+  for (let i = 0; i < entries.length; i += SQL_BATCH_CHUNK) {
+    const chunk = entries.slice(i, i + SQL_BATCH_CHUNK)
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        await db.execute(sql`
+          INSERT INTO token_balances (token_address, holder_address, balance)
+          VALUES ${sql.join(
+            chunk.map(e => sql`(${e.token}::varchar(42), ${e.holder}::varchar(42), ${e.delta.toString()}::numeric)`),
+            sql`, `
+          )}
+          ON CONFLICT (token_address, holder_address) DO UPDATE
+            SET balance = token_balances.balance + EXCLUDED.balance
+        `)
+        break
+      } catch (err) {
+        if (isDeadlock(err) && attempt < 3) {
+          await new Promise(r => setTimeout(r, 50 * attempt))
+          continue
+        }
+        throw err
+      }
+    }
+  }
+}
+
+// ── Async token_transfers writer (crash-safe, coalescing) ───────────
+// token_transfers is PRIMARY data, so unlike the holder/address coalescers we
+// must NOT lose the queue on crash. The contract (mirrored by index.ts resume):
+//
+//   • Single writer.   Only this writer INSERTs token_transfers — block workers
+//     just enqueue. That removes the 8-worker index contention that made the
+//     inline insert ~50% of BNB block time.
+//   • Durable watermark. indexer_cursor.transfers_durable_block = W means every
+//     block ≤ W has ALL its transfers committed. It is the crash-resume point.
+//   • W advances only AFTER a commit, through the contiguous prefix of written
+//     blocks. Writing ahead of W is fine — replay re-writes idempotently.
+//   • Each drain is written DELETE+INSERT inside one transaction, targeting
+//     EXACTLY the drained block numbers. Reads never see a half-written block;
+//     replay is a clean overwrite (no dupes, no reliance on a unique constraint,
+//     so it works identically on the block-range-partitioned table — Part B).
+// Backpressure bound on pending rows. Robust to unset/NaN/zero/negative → default
+// 50000: a malformed env must fall back to a finite bound, never disable backpressure
+// (the 838k-row OOM is why this exists). It must also never stay NaN — the dual-bound
+// loops below break on `rows <= bound`, and `x <= NaN` is always false, so a NaN bound
+// would throttle forever even on an empty queue (codex P2). Was a bare parseInt with a
+// `?? '50000'` that only defaulted on unset, leaving empty/garbage env → NaN.
+const TT_QUEUE_HIGH_WATER_ROWS = indexerConfig.transferWriter.queueHighWaterRows
+// Parallel backpressure bound on the pending BLOCK COUNT (transferPending.size), not
+// just rows. The rows bound above never engages for an all-transfer-less block range
+// with a stalled writer — rows stays ~0 while the pending Map grows unbounded (codex
+// P2 deferred from PR #43/#44). Bounding blocks caps that Map (and the W↔tip crash
+// replay window) regardless of how few transfers the range carries. Robust to
+// unset/NaN/zero/negative → default 2000. Backpressure only — the high-water ALERT
+// (TT_QUEUE_ALERT_ROWS) stays rows-only; a genuinely stuck writer is already caught by
+// the consecutive-write-failure alert, which is failure-count- not row-driven.
+const TT_QUEUE_HIGH_WATER_BLOCKS = indexerConfig.transferWriter.queueHighWaterBlocks
+// Pending-rows threshold for the high-water ALERT, decoupled from the backpressure
+// bound above. PR #43 reused TT_QUEUE_HIGH_WATER_ROWS for both, so the WARN tripped on
+// every momentary ride along the backpressure ceiling (13 benign fires the first day,
+// all ~50,000–50,200 rows with W advancing). The alert must mean "backpressure is
+// FAILING to contain the queue" (the 838k June incident), not "the queue is busy" — so
+// it gets its own, higher bound: default 2× the backpressure bound, floored AT the bound
+// so a misconfigured override can never make the alert noisier than PR #43 was. Pairs
+// with the lower recovery edge in evaluateTransferQueueHighWater() to form a hysteresis
+// band that can't flap.
+const TT_QUEUE_ALERT_ROWS = indexerConfig.ttQueueAlertRows
+// Consecutive failed drains before the writer escalates from a per-attempt warn to a
+// loud error alert (and again every Nth failure after). Mirrors webhook-notifier's
+// "deactivate after 5 consecutive failures" pattern — here we never give up (transfers
+// are primary data), we just get loud so log-based monitoring fires.
+const TT_WRITER_FAILURE_ALERT_THRESHOLD = indexerConfig.transferWriter.failureAlertThreshold
+/**
+ * A queued write for one block.
+ *
+ * `quarantine` marks a batch that asserts NOTHING about the block's transfers —
+ * it exists only so the watermark fold can advance past a height the indexer has
+ * given up on. Such a batch must never DELETE and never INSERT.
+ *
+ * The flag rides WITH the batch rather than living in a parallel set, and that is
+ * deliberate. It has to survive the drain, the 250ms requeue-retry, and the reorg
+ * purge, and every earlier attempt at holding quarantine state alongside the queue
+ * drifted out of sync in a way review caught only after the fact. Carried inline,
+ * there is nothing to keep in sync: a later real decode simply replaces the entry
+ * (see enqueueTransferWrite), which revokes the quarantine as a side effect of the
+ * existing "latest decode of a block wins" rule.
+ */
+type PendingBatch = { rows: TokenTransferRow[]; quarantine: boolean }
+
+let transferPending = new Map<number, PendingBatch>()
+let transferPendingRows = 0
+const transferWritten = new Set<number>()   // committed, not yet folded into W
+let durableBlock = 0
+let transferWriterSeeded = false
+let transferWriterRunning = false
+let transferWriterPaused = false            // reorg rollback quiesce (see rollbackTransferWriterTo)
+let ttWriterDrainCount = 0
+
+// ── produce/drain overlap diagnostics (TT_WRITER_PROFILE=1) ──────────────────
+//
+// Measured 2026-08-17: the writer sustains 919 rows/s while block workers are
+// parked on backpressure, but the system averages only ~594 rows/s — and 919
+// already exceeds the ~701 rows/s needed to match chain. So the deficit is NOT
+// write capacity; it is that producing and draining do not overlap. Three
+// mechanisms explain that and they are distinguishable only by measuring AT the
+// event, which is the whole reason this exists (a sampled queue depth was what
+// produced the wrong root cause earlier that day):
+//
+//   M1 connection starvation — the writer is the 9th consumer of a
+//      DB_POOL_SIZE=8 pool and holds one slot for a whole transaction.
+//   M2 event-loop starvation — 8 decoding workers saturate the single Node
+//      thread.
+//   M3 pure rate mismatch — oscillation is inherent.
+//
+// ⚠ READ THIS BEFORE DRAWING A CONCLUSION FROM THESE NUMBERS.
+//
+// The metrics below are HINTS, not the verdict. Review established that the
+// acq/lag split cannot cleanly separate M1 from M2/M3 from inside the process:
+//   • `tEnter - tStart` also contains connection setup, network RTT and the
+//     server-side BEGIN, none of which shows up as event-loop lag — so high acq
+//     with low lag can mean a busy DATABASE rather than a starved local pool;
+//   • the `none` bucket counts workers that are alive and unparked, but those
+//     may all be awaiting RPC inside processBlock and holding no DB slot at all,
+//     so `none` mixes real contention with idle periods.
+//
+// The VERDICT comes from the A/B on TT_WRITER_DEDICATED_POOL against the
+// measured baseline (1.880 blk/s indexed, 64.7% of wall clock stalled), because
+// that removes the contention instead of trying to observe it. Treating one of
+// these observational numbers as proof is exactly the error that produced a
+// confidently wrong root cause earlier the same day, from a queue depth that was
+// only ever a lower bound. Use them to explain a result, never to establish one.
+//
+// Diagnostic only: nothing here changes behaviour, and it is off unless
+// TT_WRITER_PROFILE=1 so the default path pays only a boolean test.
+const TT_WRITER_PROFILE = indexerConfig.transferWriter.profile
+const TT_PROFILE_WINDOW_MS = indexerConfig.transferWriter.profileWindowMs
+/** Block workers currently parked in the backpressure poll loop (index.ts). */
+let parkedWorkers = 0
+/**
+ * Worker-pool size, so "all parked" is a real state rather than a guess.
+ * 0 = unset, which collapses ALL and PARTIAL into one bucket and is reported as
+ * such — an unset pool size must not silently masquerade as a clean measurement.
+ */
+let profWorkerCount = 0
+/**
+ * Three phases, not two. (codex P2.)
+ *
+ * A binary `parkedWorkers > 0` labels a drain "blocked" even when only 1 of 8
+ * workers has parked and the other 7 are still decoding and holding pool slots.
+ * Those transition periods are exactly where contention is HIGHEST, so folding
+ * them into the blocked bucket drags the blocked rate down toward the running
+ * rate — i.e. it makes M1 (connection starvation) look like M3 (inherent
+ * oscillation), which is the one confusion this experiment exists to resolve.
+ *
+ *   NONE    — every worker decoding. Full competition for the pool.
+ *   PARTIAL — some parked. Transitional; reported but never used to conclude.
+ *   ALL     — every worker parked. The writer has the pool to itself.
+ *
+ * The verdict comes from NONE vs ALL. PARTIAL is printed so a run where most
+ * drains land there is visibly inconclusive rather than quietly wrong.
+ */
+type DrainPhase = 'none' | 'partial' | 'all'
+const ttProf = {
+  since: 0,
+  rows: { none: 0, partial: 0, all: 0 },
+  ms: { none: 0, partial: 0, all: 0 },
+  acq: { none: 0, partial: 0, all: 0 },
+  passesBy: { none: 0, partial: 0, all: 0 },
+  acquireMaxMs: 0, sqlMs: 0, passes: 0,
+  blocks: { none: 0, partial: 0, all: 0 },
+  // NOT "pool starvation count". postgres.js `connect_timeout` covers TCP,
+  // protocol and auth startup — NOT waiting on an occupied local pool slot — and
+  // this catch sees every pre-callback throw, so a network or auth failure lands
+  // here too. Reported as a neutral "preCbFail" and never as M1 evidence on its
+  // own; a spike here means "go read the writer's error logs", not "starvation
+  // confirmed". (codex P2.)
+  preCbFail: 0,
+  // Lag is bucketed BY PHASE. A window-wide average lets a lag spike during
+  // `all` make high `none` acquisition look scheduler-bound, and lets low-lag
+  // `all` samples dilute genuine event-loop starvation during `none` — which
+  // reintroduces exactly the M1/M2 confusion the probe was added to remove.
+  // (codex P2.)
+  lagSum: { none: 0, partial: 0, all: 0 },
+  lagN: { none: 0, partial: 0, all: 0 },
+  lagMax: { none: 0, partial: 0, all: 0 },
+}
+
+/**
+ * Event-loop lag probe. (codex P1.)
+ *
+ * `tEnter - tStart` around db.transaction() CANNOT be read as pool-acquisition
+ * time on its own: when the event loop is saturated, the transaction callback is
+ * scheduled late even after a connection was already available, so M2 inflates
+ * exactly the number that was supposed to identify M1. Measuring loop lag
+ * independently makes the two separable:
+ *
+ *   high acquire + LOW lag  -> real pool wait          (M1)
+ *   high acquire + HIGH lag -> scheduling delay        (M2)
+ *
+ * A timer scheduled for `interval` that fires at `interval + d` has observed
+ * `d` ms of loop lag. Unref'd so it can never hold the process open at shutdown.
+ */
+const LOOP_LAG_INTERVAL_MS = 500
+function startLoopLagProbe(): void {
+  let last = performance.now()
+  const timer = setInterval(() => {
+    const now = performance.now()
+    const lag = Math.max(0, now - last - LOOP_LAG_INTERVAL_MS)
+    last = now
+    // Attribute each sample to the phase in effect right now, so lag is
+    // comparable against that phase's acquisition time.
+    const p = phaseFor(parkedWorkers, activeWorkers, profWorkerCount)
+    ttProf.lagSum[p] += lag
+    ttProf.lagN[p]++
+    if (lag > ttProf.lagMax[p]) ttProf.lagMax[p] = lag
+    // Emission is driven from HERE, not from a completed drain. If transactions
+    // keep failing before callback entry, no drain ever completes — so a
+    // drain-driven emitter would print nothing for the entire failure period and
+    // then start a fresh window on the first recovery, hiding the failure by
+    // another full interval. This ticks regardless. (codex P2.)
+    maybeEmitProfile()
+  }, LOOP_LAG_INTERVAL_MS)
+  timer.unref?.()
+}
+
+/**
+ * Tell the profile how many block workers exist, so ALL is distinguishable from
+ * PARTIAL. Called from index.ts with CONCURRENCY.
+ */
+export function setProfileWorkerCount(n: number): void {
+  profWorkerCount = Number.isFinite(n) && n > 0 ? n : 0
+}
+
+/** Block workers currently alive in the batch loop (index.ts). */
+let activeWorkers = 0
+
+/**
+ * Report a block worker entering (+1) or leaving (-1) the batch loop.
+ *
+ * NOT redundant with noteWorkerParked. A worker that reaches the tail of a batch
+ * hits `claimNext() === -1` and RETURNS without ever parking, so `parked === 0`
+ * happens both when all 8 workers are hammering the pool and when 7 have gone
+ * home and one straggler remains. Those are opposite contention regimes, and
+ * conflating them drags the `none` bucket toward the `all` bucket — concealing
+ * connection starvation, the exact thing being tested for. (codex P2, round 2.)
+ */
+export function noteWorkerActive(delta: number): void {
+  activeWorkers = Math.max(0, activeWorkers + delta)
+}
+
+/**
+ * Classify a drain pass. Pure and exported so the mapping is tested by CALLING
+ * it — a previous version asserted only that the source contained the right
+ * literals, which would have passed even with the branch dead. (codex P2.)
+ *
+ * `none` demands a FULL pool of active workers and none parked; anything else
+ * short of a full park is `partial`, i.e. reported but never concluded from.
+ */
+export function phaseFor(parked: number, active: number, workerCount: number): DrainPhase {
+  // Without a known pool size nothing can be classified; say so rather than
+  // guessing, and let the log line label the window inconclusive.
+  if (!(workerCount > 0)) return 'partial'
+  // `>=` not `===`: if the count ever over-reports, the safe reading is "the
+  // writer had the pool to itself", which weakens the contention conclusion
+  // rather than inventing one.
+  if (parked >= workerCount) return 'all'
+  if (parked === 0 && active >= workerCount) return 'none'
+  return 'partial'
+}
+
+/**
+ * Report a block worker entering (+1) or leaving (-1) the backpressure wait.
+ *
+ * Called from the poll loop in index.ts. This is what lets the writer attribute
+ * each drain pass to a PHASE — the single number that discriminates M3 (rates
+ * equal) from M1/M2 (rates differ). Cheap and monotonic; never let it drift
+ * negative, since a stuck negative count would silently mislabel every
+ * subsequent pass as "running".
+ */
+export function noteWorkerParked(delta: number): void {
+  parkedWorkers = Math.max(0, parkedWorkers + delta)
+}
+
+function recordDrainPass(rows: number, blocks: number, acquireMs: number, sqlMs: number, phase: DrainPhase): void {
+  const now = Date.now()
+  if (ttProf.since === 0) ttProf.since = now
+  ttProf.passes++
+  if (acquireMs > ttProf.acquireMaxMs) ttProf.acquireMaxMs = acquireMs
+  ttProf.sqlMs += sqlMs
+  ttProf.rows[phase] += rows
+  ttProf.blocks[phase] += blocks
+  ttProf.ms[phase] += acquireMs + sqlMs
+  ttProf.acq[phase] += acquireMs
+  ttProf.passesBy[phase]++
+  maybeEmitProfile()
+}
+
+function maybeEmitProfile(): void {
+  const now = Date.now()
+  if (ttProf.since === 0) ttProf.since = now
+  if (now - ttProf.since < TT_PROFILE_WINDOW_MS) return
+  // Nothing observed at all — don't emit an empty line every window.
+  if (ttProf.passes === 0 && ttProf.preCbFail === 0) { ttProf.since = now; return }
+  // Every denominator is guarded: a window can legitimately contain zero passes
+  // in a phase (e.g. no worker ever parked), and a NaN in the one line the whole
+  // experiment is read from would be indistinguishable from a real reading.
+  // Mean rows AND blocks per pass are printed alongside the rate because the two
+  // phases drain differently shaped batches — an `all` pass empties a backlog
+  // accumulated at the high-water bound, a `none` pass is usually small — and
+  // fixed per-transaction overhead alone makes those rates differ at identical
+  // resource availability. Without the shape, a rate gap cannot be attributed.
+  // (codex P2.)
+  // acq and lag are printed TOGETHER per phase — that pairing is the whole
+  // discriminator. High acq with LOW lag in the same phase is a real pool wait
+  // (M1); high acq with HIGH lag is scheduling delay (M2).
+  const per = (p: DrainPhase) => {
+    const n = ttProf.passesBy[p]
+    const ln = ttProf.lagN[p]
+    const lag = ln > 0 ? `${(ttProf.lagSum[p] / ln).toFixed(0)}/${ttProf.lagMax[p].toFixed(0)}ms` : '—'
+    if (n === 0) return `${p} — (lag ${lag})`
+    const ms = ttProf.ms[p]
+    const rate = ms > 0 ? (ttProf.rows[p] / (ms / 1000)).toFixed(0) : '—'
+    return `${p} ${rate} rows/s (n=${n}, ${(ttProf.rows[p] / n).toFixed(0)}r+${(ttProf.blocks[p] / n).toFixed(0)}blk/pass, acq ${(ttProf.acq[p] / n).toFixed(0)}ms, lag ${lag})`
+  }
+  const verdict =
+    profWorkerCount === 0 ? ' [pool size UNSET — inconclusive]'
+    : ttProf.passesBy.none === 0 || ttProf.passesBy.all === 0 ? ' [need both none+all passes to conclude]'
+    : ''
+  console.log(
+    `[tt-writer] PROFILE ${((now - ttProf.since) / 1000).toFixed(0)}s: ` +
+    `${per('none')} | ${per('partial')} | ${per('all')} | ` +
+    `sql avg ${ttProf.passes > 0 ? (ttProf.sqlMs / ttProf.passes).toFixed(0) : '—'}ms, ` +
+    `acq max ${ttProf.acquireMaxMs.toFixed(0)}ms, ` +
+    // Deliberately NOT called a starvation count — see the field comment. A
+    // spike means "read the writer's error logs", not "M1 confirmed".
+    `preCbFail ${ttProf.preCbFail}, passes ${ttProf.passes}${verdict}`,
+  )
+  ttProf.since = now
+  for (const p of ['none', 'partial', 'all'] as const) {
+    ttProf.rows[p] = ttProf.blocks[p] = ttProf.ms[p] = ttProf.acq[p] = ttProf.passesBy[p] = 0
+    ttProf.lagSum[p] = ttProf.lagN[p] = ttProf.lagMax[p] = 0
+  }
+  ttProf.acquireMaxMs = ttProf.sqlMs = ttProf.passes = 0
+  ttProf.preCbFail = 0
+}
+let ttQueueOverHighWater = false      // edge-trigger so the high-water alert fires once per breach
+let ttWriterConsecutiveFailures = 0   // resets on a successful drain; drives the write-failing alert
+
+/**
+ * Seed the in-memory watermark from indexer_cursor at startup. MUST be called by
+ * index.ts before the indexing loop — without a seed the writer refuses to run
+ * (so it can never persist a bogus W=0 over a real cursor).
+ */
+export function initTransferWriter(seedDurableBlock: number): void {
+  durableBlock = seedDurableBlock
+  transferWriterSeeded = true
+  console.log(`[tt-writer] seeded durable watermark = ${durableBlock} (backpressure bounds ${TT_QUEUE_HIGH_WATER_ROWS} rows / ${TT_QUEUE_HIGH_WATER_BLOCKS} blocks, alert bound ${TT_QUEUE_ALERT_ROWS} rows)`)
+  // State the resolved value, not the intent. An env-gated diagnostic that is
+  // silently off looks identical to one that is on and finding nothing, and this
+  // codebase has shipped an inert fix that way before (#92). Grep this line.
+  console.log(
+    TT_WRITER_PROFILE
+      ? `[tt-writer] produce/drain PROFILE ON (window ${TT_PROFILE_WINDOW_MS}ms) — emits "[tt-writer] PROFILE" lines`
+      : `[tt-writer] produce/drain profile OFF (set TT_WRITER_PROFILE=1 to diagnose backpressure oscillation)`,
+  )
+  // The A/B arm. Printed unconditionally and from the RESOLVED env value, so a
+  // run can never be attributed to the wrong arm after the fact.
+  console.log(
+    indexerConfig.transferWriter.dedicatedPool
+      ? `[tt-writer] dedicated writer pool ON (TT_WRITER_POOL_SIZE=${indexerConfig.transferWriter.poolSize}) — not competing with block workers for slots`
+      : `[tt-writer] dedicated writer pool OFF — sharing the ingestion pool with block workers`,
+  )
+  if (TT_WRITER_PROFILE) startLoopLagProbe()
+  runTransferWriter()  // flush anything enqueued during startup
+}
+
+/**
+ * Ranges a MAX_LAG skip abandoned, in skip order: W may jump from `after` (the cursor
+ * before the skip) to `to` once the fold has reached `after`. See setDurableFloor.
+ */
+let pendingFloors: Array<{ after: number; to: number }> = []
+
+/** The next abandoned range is ready to be stepped over: everything below it is durable. */
+function floorReady(): boolean {
+  return pendingFloors.length > 0 && durableBlock >= pendingFloors[0].after
+}
+
+/**
+ * Let the watermark step over a range the indexer deliberately abandoned (the MAX_LAG
+ * "skip to tip" path in index.ts). Without this, W would freeze at the skip boundary
+ * because the skipped blocks are never enqueued. Accepts the same gap the skip creates
+ * in `blocks`; the resume gap-scan heals recent holes on restart.
+ *
+ * It does not move W itself. W used to jump to `to` at once, over (W, after] too, and
+ * those blocks are routinely processed but still queued: a crash then lost their rows
+ * for good, because crash-resume replays only from W upward (the same reason the
+ * quarantine path uses a quarantine batch). And W moved in memory before a fire-and-
+ * forget persist that swallowed failure. Now the writer's fold steps over the range once
+ * it reaches `after`, and persists before it advances, retrying a failed persist like
+ * any other.
+ */
+export function setDurableFloor(floor: { after: number; to: number }): void {
+  if (!transferWriterSeeded || floor.to <= floor.after) return
+  pendingFloors.push(floor)
+  runTransferWriter()
+}
+
+/**
+ * Reorg support (A3): drop queued-but-unwritten transfer decodes for blocks ABOVE
+ * the fork point, so the writer can't insert orphaned-chain rows after unwindFrom()
+ * deleted them. Rows at or below the fork are canonical — kept. Also clears
+ * transferWritten above the fork so a later fold can't re-advance W over blocks
+ * whose rows were just unwound. Call via rollbackTransferWriterTo (which quiesces
+ * the writer first — a purge alone can't see a batch an active drain already moved
+ * into its local map; codex P2 on PR #67).
+ */
+export function purgeTransferQueueAbove(forkPoint: number): void {
+  let dropped = 0
+  for (const [n, batch] of transferPending) {
+    if (n > forkPoint) {
+      // Quarantine batches are dropped here too, and must be: above the fork the
+      // height refers to a DIFFERENT block, so a decision made about the orphan
+      // must not let the fold step over its canonical replacement.
+      transferPending.delete(n)
+      transferPendingRows -= batch.rows.length
+      dropped += batch.rows.length
+    }
+  }
+  for (const n of transferWritten) if (n > forkPoint) transferWritten.delete(n)
+  // A failure above the fork was about the orphaned block, not its replacement.
+  for (const n of blockWriteFailures.keys()) if (n > forkPoint) blockWriteFailures.delete(n)
+  if (dropped > 0) {
+    console.warn(`[tt-writer] reorg purge: dropped ${dropped} queued rows above block ${forkPoint}`)
+    evaluateTransferQueueHighWater()
+  }
+}
+
+/**
+ * Full reorg rollback for the async transfer writer (A3; codex P1+P2 on PR #67):
+ *  1. QUIESCE — pause new drains and wait out an in-flight one, so a batch already
+ *     moved into the drainer's local map can't commit stale rows after unwindFrom()
+ *     deletes them (or fold W forward past the fork again).
+ *  2. PURGE — drop queued decodes + transferWritten entries above the fork.
+ *  3. REWIND W — durableBlock claims "every block ≤ W has all transfers committed",
+ *     which is false above the fork once rows are unwound. Crash-resume takes
+ *     min(MAX(blocks.number), W), which only covers a crash BEFORE reprocessing;
+ *     if we crash mid-reprocess (block row inserted, transfers not yet drained),
+ *     a stale W resumes past that block and its transfers are lost forever. So W
+ *     must be rewound and persisted. A persist failure is logged loudly but not
+ *     fatal: the in-memory rewind stands, and the next successful drain-fold
+ *     re-persists a correct W (only a crash inside that window is exposed).
+ * Always resumes the writer, even on persist failure.
+ */
+export async function rollbackTransferWriterTo(forkPoint: number): Promise<void> {
+  transferWriterPaused = true
+  try {
+    while (transferWriterRunning) await new Promise(r => setTimeout(r, 25))
+    purgeTransferQueueAbove(forkPoint)
+    // Heights above the fork are re-indexed, so an abandoned range ends at the fork.
+    pendingFloors = pendingFloors
+      .map(f => ({ after: f.after, to: Math.min(f.to, forkPoint) }))
+      .filter(f => f.to > f.after)
+    transferHighestQueued = Math.min(transferHighestQueued, forkPoint)
+    if (transferWriterSeeded && durableBlock > forkPoint) {
+      const prev = durableBlock
+      durableBlock = forkPoint
+      try {
+        await persistDurableBlock(forkPoint)
+        console.warn(`[tt-writer] reorg rollback: durable watermark rewound ${prev} → ${forkPoint}`)
+      } catch (err) {
+        console.error(`[tt-writer] ALERT reorg rollback: watermark rewound in memory (${prev} → ${forkPoint}) but persist FAILED — a crash before the next drain-fold persists would resume past the fork:`, dbErrorMessage(err))
+      }
+    }
+  } finally {
+    transferWriterPaused = false
+    runTransferWriter()
+  }
+}
+
+export function getTransferQueueDepth(): { blocks: number; rows: number; durableBlock: number } {
+  return { blocks: transferPending.size, rows: transferPendingRows, durableBlock }
+}
+
+// Edge-triggered high-water alert for the pending queue (warn once on the way up,
+// log once on the way back down) so a sustained breach doesn't spam every enqueue.
+// The June 2026 incident saw the queue blow past the bound (~838k rows) with no signal.
+// MUST be called after every DURABLE change to transferPendingRows — enqueue,
+// post-failure requeue, and a completed drain — otherwise the flag desyncs: the
+// writer draining a breach to empty (or a requeue re-crossing the bound) happens
+// outside enqueue, so without this the recovery log is missed and the flag can stick
+// true. Deliberately NOT called at the transient top-of-loop reset to 0, which would
+// flap warn/recovered every 250ms during a write-failure retry storm.
+// Hysteresis band: WARN above TT_QUEUE_ALERT_ROWS (the high edge, only reached when
+// backpressure has lost containment) and recover at/under TT_QUEUE_HIGH_WATER_ROWS (the
+// backpressure bound the live + backfill loops throttle on). Warning at the higher edge
+// keeps normal busy-load oscillation along the backpressure ceiling silent; recovering
+// at the lower edge means "recovered" = backpressure pulled the queue back to target.
+function evaluateTransferQueueHighWater(): void {
+  if (!ttQueueOverHighWater && transferPendingRows > TT_QUEUE_ALERT_ROWS) {
+    ttQueueOverHighWater = true
+    console.warn(`[tt-writer] ALERT queue over high-water: ${transferPendingRows} rows > ${TT_QUEUE_ALERT_ROWS} alert bound — backpressure bound ${TT_QUEUE_HIGH_WATER_ROWS} not containing the queue (${transferPending.size} blocks pending, W=${durableBlock})`)
+  } else if (ttQueueOverHighWater && transferPendingRows <= TT_QUEUE_HIGH_WATER_ROWS) {
+    ttQueueOverHighWater = false
+    console.log(`[tt-writer] queue recovered: ${transferPendingRows} rows ≤ ${TT_QUEUE_HIGH_WATER_ROWS} backpressure bound`)
+  }
+}
+
+export function enqueueTransferWrite(blockNumber: number, rows: TokenTransferRow[]): void {
+  const prev = transferPending.get(blockNumber)
+  if (prev) transferPendingRows -= prev.rows.length
+  // latest decode of a block wins — and because this always writes quarantine:false,
+  // a real decode arriving for a quarantined height revokes the quarantine for free.
+  transferPending.set(blockNumber, { rows, quarantine: false })
+  transferPendingRows += rows.length
+  if (blockNumber > transferHighestQueued) transferHighestQueued = blockNumber
+  evaluateTransferQueueHighWater()
+  runTransferWriter()
+}
+
+/**
+ * Let the watermark advance past a block the indexer has quarantined.
+ *
+ * NOT `enqueueTransferWrite(n, [])`. An empty batch is indistinguishable from a
+ * transfer-less block, and writeTransferBlocks DELETEs every block it drains — so
+ * an empty batch is empty-by-OMISSION and would delete rows it never decoded. That
+ * is the same failure that made `--skip-logs` backfills lose data (see the comment
+ * above the enqueue in processBlock, and PR #42). The window is real here: this
+ * batch can sit in the 250ms requeue-retry loop, or in an outgoing deploy
+ * generation, while a heal writes the block's real transfers — and the stale retry
+ * would then delete them.
+ *
+ * A quarantine batch instead carries no claim about the block at all. It is never
+ * deleted and never inserted, so a stale retry is a complete no-op; it only ever
+ * contributes its height to the fold. If a real decode shows up first, it replaces
+ * this entry and normal semantics resume.
+ */
+export function enqueueQuarantinedBlock(blockNumber: number): void {
+  const prev = transferPending.get(blockNumber)
+  // A real decode already queued for this height OUTRANKS the quarantine — it
+  // carries actual rows, and downgrading it to a no-op would drop them.
+  if (prev && !prev.quarantine) return
+  // Keep the row counter honest. Today `prev` can only be another quarantine batch
+  // (zero rows), so this subtracts nothing — but transferPendingRows drives both the
+  // backpressure bound and the high-water ALERT, and leaving the only thing that
+  // protects it as the guard above means a future edit there corrupts the counter
+  // silently. It also makes that guard testable: without the subtraction, replacing
+  // a real batch leaves the count unchanged, so nothing observable would change.
+  if (prev) transferPendingRows -= prev.rows.length
+  transferPending.set(blockNumber, { rows: [], quarantine: true })
+  if (blockNumber > transferHighestQueued) transferHighestQueued = blockNumber
+  evaluateTransferQueueHighWater()
+  runTransferWriter()
+}
+
+/**
+ * Why one block's write failed, from its SQLSTATE, so the writer knows what may move W.
+ *
+ *  - `data` (class 22, e.g. 22P02): the block's own rows are bad, and every replay fails
+ *    the same way. After TT_BLOCK_REJECT_AFTER attempts the block is rejected.
+ *  - `missing-partition` (23514 "no partition of relation … found for row"): the range
+ *    has no token_transfers partition yet. Partitions are made and the block retried;
+ *    it never counts toward rejection.
+ *  - `infra` (classes 08, 40, 57, or a socket or connection error from the driver):
+ *    nothing is wrong with the block. The whole drain is retried quietly.
+ *  - `unknown`: anything else. Retried alone, forever, and never moves W, so a failure
+ *    mode nobody has seen cannot step W over a block.
+ */
+export type WriteFailureKind = 'data' | 'missing-partition' | 'infra' | 'unknown'
+
+export function classifyWriteFailure(err: unknown): { kind: WriteFailureKind; sqlstate: string } {
+  const e = unwrapDbError(err) as { name?: unknown; code?: unknown; message?: unknown } | null
+  const code = typeof e?.code === 'string' ? e.code : ''
+  if (e?.name !== 'PostgresError') {
+    // Not from the server. A socket or connection code (ECONNRESET, CONNECT_TIMEOUT,
+    // CONNECTION_CLOSED) is the connection, not the block; any other driver error
+    // (UNDEFINED_VALUE, MAX_PARAMETERS_EXCEEDED) may well be the block's own.
+    if (/^(E[A-Z]+|CONNECT_TIMEOUT|CONNECTION_[A-Z]+)$/.test(code)) return { kind: 'infra', sqlstate: code }
+    return { kind: 'unknown', sqlstate: code || 'none' }
+  }
+  if (code === '23514' && /no partition of relation/i.test(String(e.message))) return { kind: 'missing-partition', sqlstate: code }
+  if (code.startsWith('22')) return { kind: 'data', sqlstate: code }
+  if (/^(08|40|57)/.test(code)) return { kind: 'infra', sqlstate: code }
+  return { kind: 'unknown', sqlstate: code || 'none' }
+}
+
+/** Data failures before a block is rejected: recorded as a gap, then stepped over. */
+export const TT_BLOCK_REJECT_AFTER = 5
+const TT_BLOCK_RETRY_BASE_MS = 250
+const TT_BLOCK_RETRY_MAX_MS = 30_000
+
+/**
+ * Heights whose own write failed. Each is retried ALONE, after a capped backoff, while
+ * the blocks around it commit: W folds contiguously, so it stays below the failing
+ * block, and a restart replays from there, which is replay-safe. `rejections` counts
+ * only data failures; `attempts` drives the backoff.
+ */
+const blockWriteFailures = new Map<number, { rejections: number; attempts: number; retryAt: number; sqlstate: string }>()
+let blockRetryTimer: ReturnType<typeof setTimeout> | null = null
+let transferHighestQueued = 0
+let watermarkLagAlerting = false
+
+/** Take every queued batch that is not waiting out a backoff. */
+function takeDueBatches(now: number): Map<number, PendingBatch> {
+  const due = new Map<number, PendingBatch>()
+  for (const [n, batch] of transferPending) {
+    const f = blockWriteFailures.get(n)
+    if (!f || f.retryAt <= now) due.set(n, batch)
+  }
+  for (const [n, batch] of due) {
+    transferPending.delete(n)
+    transferPendingRows -= batch.rows.length
+  }
+  return due
+}
+
+/** One transaction for these batches. A quarantine batch is never deleted or inserted. */
+async function writeBatches(batches: Map<number, PendingBatch>): Promise<void> {
+  const deleteNums: number[] = []
+  const rows: TokenTransferRow[] = []
+  for (const [n, batch] of batches) {
+    if (!batch.quarantine) deleteNums.push(n)
+    for (const r of batch.rows) rows.push(r)
+  }
+  if (deleteNums.length === 0 && rows.length === 0) return
+  // Sort by (block_number, log_index): keeps tt_block_idx writes sequential
+  // and clusters same-block rows for better index-leaf locality.
+  rows.sort((a, b) => a.blockNumber - b.blockNumber || a.logIndex - b.logIndex)
+  await writeTransferBlocks(deleteNums, rows)
+}
+
+function requeueBatch(n: number, batch: PendingBatch): void {
+  // Don't clobber a newer decode of the same block.
+  if (transferPending.has(n)) return
+  transferPending.set(n, batch)
+  transferPendingRows += batch.rows.length
+}
+
+/**
+ * Write a drained set and return the heights that are now durable. The set goes in one
+ * transaction; if that fails for a reason that is not infrastructure, each block is
+ * written alone, in order, so one bad block no longer holds back every block after it.
+ * Blocks already failing go alone from the start. Throws only for an infrastructure
+ * failure, which the caller retries as a whole.
+ */
+async function writeDrained(drained: Map<number, PendingBatch>): Promise<number[]> {
+  const healthy = new Map([...drained].filter(([n]) => !blockWriteFailures.has(n)))
+  const alone = [...drained.keys()].filter(n => blockWriteFailures.has(n))
+  const written: number[] = []
+  if (healthy.size > 0) {
+    try {
+      await writeBatches(healthy)
+      written.push(...healthy.keys())
+    } catch (err) {
+      const c = classifyWriteFailure(err)
+      if (c.kind === 'infra') throw err
+      console.warn(`[tt-writer] write of ${healthy.size} block(s) failed (${c.sqlstate}); writing each alone to find the one that fails`)
+      alone.push(...healthy.keys())
+    }
+  }
+  alone.sort((a, b) => a - b)
+  let partitionsMade = false
+  for (const n of alone) {
+    const batch = drained.get(n)!
+    try {
+      await writeBatches(new Map([[n, batch]]))
+      written.push(n)
+      blockWriteFailures.delete(n)
+    } catch (err) {
+      const c = classifyWriteFailure(err)
+      if (c.kind === 'infra') throw err
+      requeueBatch(n, batch)
+      const prev = blockWriteFailures.get(n)
+      const attempts = (prev?.attempts ?? 0) + 1
+      const rejections = (prev?.rejections ?? 0) + (c.kind === 'data' ? 1 : 0)
+      blockWriteFailures.set(n, {
+        rejections,
+        attempts,
+        retryAt: Date.now() + Math.min(TT_BLOCK_RETRY_BASE_MS * 2 ** (attempts - 1), TT_BLOCK_RETRY_MAX_MS),
+        sqlstate: c.sqlstate,
+      })
+      const msg = dbErrorMessage(err).slice(0, 300)
+      if (c.kind === 'missing-partition') {
+        console.error(`[tt-writer] ALERT block ${n} has no token_transfers partition (${c.sqlstate}): making partitions and retrying`)
+        if (!partitionsMade) {
+          partitionsMade = true
+          const covered = await ensureForwardPartitions({ anchor: n }).catch(e => {
+            console.warn('[tt-writer] ensureForwardPartitions warning:', dbErrorMessage(e))
+            return n
+          })
+          // Covered now: no reason to wait out the backoff.
+          if (covered === null || covered > n) blockWriteFailures.get(n)!.retryAt = Date.now()
+        }
+      } else if (c.kind === 'data') {
+        console.error(`[tt-writer] ALERT block ${n} rejected: ${c.sqlstate} (${rejections}/${TT_BLOCK_REJECT_AFTER}), W held at ${durableBlock}: ${msg}`)
+        if (rejections >= TT_BLOCK_REJECT_AFTER) await rejectBlock(n, batch, c.sqlstate)
+      } else {
+        console.error(`[tt-writer] ALERT block ${n} write failed with unrecognised ${c.sqlstate}, retrying alone, W held at ${durableBlock}: ${msg}`)
+      }
+    }
+  }
+  return written
+}
+
+/**
+ * A block whose own rows fail the same way every time: record it as a 1-block gap
+ * (`tt_rejected(<sqlstate>)`, /api/health then reports degraded), and only once that
+ * row has committed, replace its batch with a quarantine batch so the fold can carry W
+ * past it. If the gap write fails, nothing is replaced and W stays: the block is
+ * retried and rejected again later. A restart before the fold replays the block, which
+ * fails again and finds its gap row already there.
+ */
+async function rejectBlock(n: number, batch: PendingBatch, sqlstate: string): Promise<void> {
+  try {
+    await recordIndexGapIfAbsent(getDb(), n, `tt_rejected(${sqlstate})`)
+  } catch (err) {
+    console.error(`[tt-writer] ALERT block ${n}: could not record its gap, so it is kept and W stays at ${durableBlock}: ${dbErrorMessage(err)}`)
+    return
+  }
+  // Only the batch that failed: a newer decode of the block gets its own attempts.
+  if (transferPending.get(n) !== batch) return
+  transferPending.set(n, { rows: [], quarantine: true })
+  transferPendingRows -= batch.rows.length
+  blockWriteFailures.delete(n)
+  console.error(`[tt-writer] ALERT block ${n} rejected ${TT_BLOCK_REJECT_AFTER} times (${sqlstate}): recorded as a 1-block index gap; its transfers are left out and W may pass it`)
+}
+
+/** Edge-triggered: W pinned below a failing block while the blocks above it keep committing. */
+function evaluateWatermarkLag(): void {
+  const lag = transferHighestQueued - durableBlock
+  if (!watermarkLagAlerting && lag > TT_QUEUE_HIGH_WATER_BLOCKS) {
+    watermarkLagAlerting = true
+    const held = [...blockWriteFailures.entries()].sort((a, b) => a[0] - b[0])[0]
+    console.error(`[tt-writer] ALERT W trails cursor by ${lag} blocks (W=${durableBlock}, newest queued ${transferHighestQueued}${held ? `, held at block ${held[0]} by ${held[1].sqlstate}` : ''})`)
+  } else if (watermarkLagAlerting && lag <= TT_QUEUE_HIGH_WATER_BLOCKS) {
+    watermarkLagAlerting = false
+    console.log(`[tt-writer] W caught up: trails by ${lag} blocks`)
+  }
+}
+
+/** Come back for the earliest block waiting out a backoff. */
+function scheduleBlockRetry(): void {
+  let next = Infinity
+  for (const n of transferPending.keys()) {
+    const f = blockWriteFailures.get(n)
+    if (f) next = Math.min(next, f.retryAt)
+  }
+  if (blockRetryTimer) clearTimeout(blockRetryTimer)
+  blockRetryTimer = null
+  if (next === Infinity) return
+  blockRetryTimer = setTimeout(() => { blockRetryTimer = null; runTransferWriter() }, Math.max(0, next - Date.now()))
+  blockRetryTimer.unref?.()
+}
+
+function runTransferWriter(): void {
+  if (!transferWriterSeeded) return        // never write/persist before the seed
+  if (transferWriterPaused) return         // reorg rollback in progress — resumed by rollbackTransferWriterTo
+  if (transferWriterRunning) return
+  if (transferPending.size === 0 && !floorReady()) return
+  transferWriterRunning = true
+  // Fire-and-forget single drainer — coalesces the due queue per pass.
+  ;(async () => {
+    try {
+      // Checking paused per iteration lets an in-flight drain finish its current
+      // batch (commit or requeue) and then yield to a waiting reorg rollback.
+      while (!transferWriterPaused) {
+        // A block waiting out a backoff stays queued and is not taken. A ready floor
+        // alone runs a pass with nothing to write, so W steps over the abandoned range
+        // even when no block is queued.
+        const drained = takeDueBatches(Date.now())
+        if (drained.size === 0 && !floorReady()) break
+
+        try {
+          const written = await writeDrained(drained)
+
+          // Fold written blocks into W through the contiguous prefix. Compute the new
+          // watermark first and only advance durableBlock / clear transferWritten AFTER
+          // persistDurableBlock() commits. The old order advanced in memory before the
+          // persist, so a failed persist was never retried (the next cycle saw nothing to
+          // move) AND the in-memory watermark ran ahead of the durable one — masking a
+          // sustained indexer_cursor outage. Holding state until the persist lands makes
+          // the failure recur every cycle, so it both retries and feeds the failure ALERT.
+          // An abandoned range is stepped over only once the prefix has reached its
+          // `after`, and the floors are dropped only after the persist lands. A block
+          // that failed is not in `written`, so W stops below it.
+          for (const n of written) if (n > durableBlock) transferWritten.add(n)
+          let newDurable = durableBlock
+          let floorsUsed = 0
+          for (;;) {
+            while (transferWritten.has(newDurable + 1)) newDurable++
+            const floor = pendingFloors[floorsUsed]
+            if (!floor || newDurable < floor.after) break
+            newDurable = Math.max(newDurable, floor.to)
+            floorsUsed++
+          }
+          if (newDurable > durableBlock) {
+            await persistDurableBlock(newDurable)
+            for (const n of transferWritten) if (n <= newDurable) transferWritten.delete(n)
+            durableBlock = newDurable
+          }
+          pendingFloors.splice(0, floorsUsed)
+
+          // Rows are durable now — let holder-balance tracking see them.
+          // (no-op while SKIP_HOLDER_BALANCES is true, but keeps the path correct).
+          const rows = written.flatMap(n => drained.get(n)!.rows)
+          if (rows.length > 0) enqueueHolderBalanceUpdate(rows)
+
+          // Only clear the failure streak after the FULL cycle succeeded (write AND
+          // watermark persist). Resetting right after writeTransferBlocks would mask a
+          // persistDurableBlock() failure: the catch re-increments from 0 each retry, so a
+          // frozen-watermark loop (write OK, persist failing while new blocks arrive) would
+          // never reach the ALERT threshold. Announce recovery if we'd previously alerted.
+          if (ttWriterConsecutiveFailures >= TT_WRITER_FAILURE_ALERT_THRESHOLD) {
+            console.log(`[tt-writer] writer recovered after ${ttWriterConsecutiveFailures} consecutive failure(s)`)
+          }
+          ttWriterConsecutiveFailures = 0
+          evaluateWatermarkLag()
+
+          if (++ttWriterDrainCount % 200 === 0) {
+            console.log(`[tt-writer] W=${durableBlock} pending=${transferPending.size}blk/${transferPendingRows}rows ahead=${transferWritten.size}`)
+          }
+        } catch (err) {
+          // Infrastructure, or the W persist: nothing here is about one block, so nothing
+          // counts toward a rejection.
+          ttWriterConsecutiveFailures++
+          const msg = dbErrorMessage(err)
+          // Re-queue (don't clobber a newer decode of the same block). The
+          // quarantine flag travels inside the batch, so a requeued quarantine
+          // stays a no-op and a requeued real batch stays a real write — no
+          // separate bookkeeping to fall out of step across the retry.
+          for (const [n, batch] of drained) requeueBatch(n, batch)
+          // A requeue can push the pending count back over the bound without an enqueue —
+          // re-evaluate so a breach during a failure storm still surfaces. No-op when the
+          // flag is already set, so it won't flap against the per-retry failure alert below.
+          evaluateTransferQueueHighWater()
+          // token_transfers is primary data, so the writer retries forever rather than
+          // dropping the queue. But a sustained failure streak means the durable watermark
+          // is frozen and rows are piling up unwritten — escalate from the per-attempt warn
+          // to a loud error at the threshold (and every Nth after) so monitoring fires.
+          if (
+            ttWriterConsecutiveFailures >= TT_WRITER_FAILURE_ALERT_THRESHOLD &&
+            ttWriterConsecutiveFailures % TT_WRITER_FAILURE_ALERT_THRESHOLD === 0
+          ) {
+            console.error(`[tt-writer] ALERT write failing: ${ttWriterConsecutiveFailures} consecutive failure(s), queue not draining (W=${durableBlock}, ${transferPendingRows} rows pending): ${msg}`)
+          } else {
+            console.warn('[tt-writer] write failed, re-queueing:', msg)
+          }
+          await new Promise(r => setTimeout(r, 250))
+        }
+      }
+      // Fire the recovery log if we'd alerted (the writer cleared it, not an enqueue).
+      evaluateTransferQueueHighWater()
+    } finally {
+      transferWriterRunning = false
+      scheduleBlockRetry()
+    }
+  })()
+}
+
+/**
+ * Persist a set of blocks atomically: DELETE the target blocks, then INSERT the
+ * decoded rows, in one transaction. DELETE makes replay idempotent without any
+ * unique constraint; on the first-write path it matches zero rows and is cheap.
+ * Targets EXACTLY the drained block numbers (never a min..max span) so a
+ * non-contiguous drain can't wipe an already-written neighbour.
+ */
+async function writeTransferBlocks(blockNums: number[], rows: TokenTransferRow[]): Promise<void> {
+  // Shared ingestion pool unless TT_WRITER_DEDICATED_POOL=1. When enabled, the
+  // writer stops competing for slots with the 8 block workers whose output it is
+  // draining — the direct test of the connection-starvation hypothesis, and its
+  // fix if confirmed.
+  const db = getWriterDb()
+  // Phase is snapshotted BEFORE the await: attributing the pass by the state at
+  // completion would label every pass "blocked", because a long drain is exactly
+  // what parks the workers. The question is what the writer was competing with
+  // when it STARTED.
+  const phase = TT_WRITER_PROFILE ? phaseFor(parkedWorkers, activeWorkers, profWorkerCount) : 'none'
+  const tStart = TT_WRITER_PROFILE ? performance.now() : 0
+  let tEnter = 0
+  try {
+  await db.transaction(async (tx) => {
+    // First statement inside the callback — the gap from tStart to here is
+    // connection-acquisition time, which is what separates M1 from M2.
+    if (TT_WRITER_PROFILE && tEnter === 0) tEnter = performance.now()
+    for (let i = 0; i < blockNums.length; i += SQL_BATCH_CHUNK) {
+      const chunk = blockNums.slice(i, i + SQL_BATCH_CHUNK)
+      await tx.execute(sql`
+        DELETE FROM token_transfers
+        WHERE block_number IN (${sql.join(chunk.map(n => sql`${n}`), sql`, `)})
+      `)
+    }
+    for (let i = 0; i < rows.length; i += SQL_BATCH_CHUNK) {
+      const chunk = rows.slice(i, i + SQL_BATCH_CHUNK)
+      await tx.insert(schema.tokenTransfers).values(chunk.map(r => ({
+        txHash: r.txHash,
+        logIndex: r.logIndex,
+        tokenAddress: r.tokenAddress,
+        fromAddress: r.fromAddress,
+        toAddress: r.toAddress,
+        value: r.value,
+        tokenId: r.tokenId,
+        blockNumber: r.blockNumber,
+        timestamp: r.timestamp,
+      })))
+      // Gracefully skip the rare cross-block collision the DELETE can't cover:
+      // during a deploy rollover the old (synchronous) instance briefly co-writes
+      // the tip, so a (tx_hash, log_index) can already exist under another block.
+      // Skipping matches the prior inline-insert behavior; on the future
+      // partitioned table (no unique) this is a harmless no-op. DELETE-first
+      // still provides the primary per-block idempotency.
+      .onConflictDoNothing()
+    }
+  })
+  } catch (err) {
+    // A throw BEFORE the callback ran means acquisition itself failed — a pool
+    // timeout (connect_timeout) is exactly that, and it is the single strongest
+    // signal for M1. On the success path it can never be observed, so counting
+    // it here is the difference between "no evidence of starvation" and "never
+    // looked". Rethrow untouched: the writer's retry/alerting owns this error.
+    if (TT_WRITER_PROFILE && tEnter === 0) ttProf.preCbFail++
+    throw err
+  }
+  if (TT_WRITER_PROFILE) {
+    const end = performance.now()
+    // tEnter can still be 0 if the transaction resolved without ever invoking
+    // the callback; attribute the whole span to acquisition rather than
+    // reporting a negative sqlMs.
+    const enter = tEnter === 0 ? end : tEnter
+    recordDrainPass(rows.length, blockNums.length, enter - tStart, end - enter, phase)
+  }
+}
+
+async function persistDurableBlock(block: number): Promise<void> {
+  // MUST be the writer pool, not getDb(). Every successful drain awaits this
+  // UPDATE before the writer can continue, so leaving it on the shared pool
+  // would leave the writer queued behind the very block workers the dedicated
+  // arm exists to escape — and a "no improvement" result would then fail to rule
+  // out connection starvation, silently invalidating the whole A/B. (codex P2.)
+  const db = getWriterDb()
+  await db.execute(sql`UPDATE indexer_cursor SET transfers_durable_block = ${block} WHERE id = 1`)
+}
+
+/** Drain the queue to empty — used for graceful shutdown + backpressure. */
+export async function flushTransferWriter(): Promise<void> {
+  runTransferWriter()
+  while (transferPending.size > 0 || transferWriterRunning) {
+    await new Promise(r => setTimeout(r, 25))
+  }
+}
+
+export { TT_QUEUE_HIGH_WATER_ROWS, TT_QUEUE_HIGH_WATER_BLOCKS, ASYNC_TT_WRITER }
+
+// ── Token metadata lookup ───────────────────────────────────────────
+/**
+ * Deterministic ascending lock order for a multi-row upsert.
+ *
+ * Exported so the deadlock guard is testable against the SHIPPED sort rather than
+ * a re-implementation in the test — a fix that is only defined, never wired, stays
+ * green forever (that is exactly how #92 shipped inert).
+ *
+ * Byte order, not locale: `localeCompare` is locale-sensitive and can order two
+ * hex strings differently than Postgres does. Only mutual consistency between
+ * concurrent inserters matters, so the comparison must not depend on ambient
+ * locale. Returns a NEW array — the caller's array is reused for cache warming.
+ */
+export function orderByAddress<T extends { address: string }>(rows: readonly T[]): T[] {
+  return [...rows].sort((a, b) => (a.address < b.address ? -1 : a.address > b.address ? 1 : 0))
+}
+
+/** Returns how many tokens it read metadata for (fanout-stats.ts). */
+async function ensureTokensBatch(
+  tokensToEnsure: Map<string, 'BEP20' | 'BEP721' | 'BEP1155'>,
+  provider: JsonRpcProvider,
+): Promise<number> {
+  const db = getDb()
+  const addresses = Array.from(tokensToEnsure.keys())
+  if (addresses.length === 0) return 0
+
+  // Check which already exist in DB — chunked to avoid stack overflow.
+  // Uses IN (literal list) instead of ANY(arr) because Drizzle serializes JS arrays
+  // as record literals which fail the ::text[] cast.
+  const existingResults: Array<{ address: string }> = []
+  for (let i = 0; i < addresses.length; i += SQL_BATCH_CHUNK) {
+    const chunk = addresses.slice(i, i + SQL_BATCH_CHUNK)
+    const result = await db.execute(sql`
+      SELECT address FROM tokens WHERE address IN (${sql.join(
+        chunk.map(a => sql`${a}`),
+        sql`, `
+      )})
+    `)
+    existingResults.push(...(Array.from(result) as Array<{ address: string }>))
+  }
+  const existing = existingResults
+  const existingSet = new Set(existing.map(r => r.address))
+
+  const toFetch = addresses.filter(a => !existingSet.has(a))
+  for (const a of existingSet) {
+    tokenCache.add(a)
+    if (tokenCache.size >= TOKEN_CACHE_MAX) tokenCache.clear()
+  }
+
+  if (toFetch.length === 0) return 0
+
+  // Read metadata for at most TOKEN_FETCH_PER_BLOCK, POST_WRITE_CONCURRENCY at a time across every block. The rest, and
+  // any read that times out, get the placeholder row a failed read always got (Unknown / ??? / 18 / '0'), which the
+  // metadata healer selects and repairs, decimals included (token-metadata-healer.ts).
+  const placeholder = (addr: string) => ({
+    address: addr,
+    name: UNKNOWN_NAME,
+    symbol: UNKNOWN_SYMBOL,
+    decimals: 18,
+    type: tokensToEnsure.get(addr)!,
+    totalSupply: '0',
+    holderCount: 0,
+  })
+  const { now: readNow, over } = withinBudget(toFetch, TOKEN_FETCH_PER_BLOCK)
+  if (over.length > 0) console.warn(`[tokens] metadata budget exceeded: ${over.length} of ${toFetch.length} new tokens left to the healer`)
+  const results = [
+    ...await Promise.all(readNow.map(async (addr) => {
+      try {
+        const meta = await boundedRead(tokenReads, () => fetchTokenMetadata(provider, addr), readTimeoutMs(), `token ${addr}`)
+        return {
+          ...placeholder(addr),
+          name: meta.name ?? UNKNOWN_NAME,
+          symbol: meta.symbol ?? UNKNOWN_SYMBOL,
+          decimals: meta.decimals ?? 18,
+          totalSupply: meta.totalSupply ?? '0',
+        }
+      } catch {
+        return placeholder(addr)
+      }
+    })),
+    ...over.map(placeholder),
+  ]
+
+  const valid = results
+  if (valid.length > 0) {
+    // Sort by address → consistent lock order, same discipline as flushAddresses.
+    //
+    // Without this, `valid` inherits per-block token DISCOVERY order (Promise.all
+    // preserves input order, and `toFetch` is filtered from block-scan order). Two
+    // workers indexing different blocks that touch an overlapping token set then
+    // insert those rows in DIFFERENT orders, and each waits on the index tuple the
+    // other already holds — a textbook circular wait. Postgres confirmed exactly
+    // that shape on 2026-08-12 06:23Z: both processes in `insert into "tokens" …
+    // on conflict do nothing`, each blocked on the other's transaction, CONTEXT
+    // "while inserting index tuple … in relation \"tokens\"".
+    //
+    // It is NOT a resource problem — a deadlock is a lock-ORDER property, so no
+    // amount of RAM or disk removes it. Ascending address order on every inserter
+    // makes a cycle impossible.
+    //
+    // It recurred 6 times in the 7 days to 2026-08-12 (Aug 5 ×3, 8, 10, 12). Each
+    // one aborts a whole block, and the resulting catch-up lag is what pushes the
+    // loop toward the MAX_LAG skip — which abandons blocks for real. Cheap fix,
+    // prevents the expensive failure downstream.
+    const ordered = orderByAddress(valid)
+    for (let i = 0; i < ordered.length; i += SQL_BATCH_CHUNK) {
+      const chunk = ordered.slice(i, i + SQL_BATCH_CHUNK)
+      // Retry the residual: ordering removes same-statement cycles, but a
+      // concurrent writer on another path can still collide. Safe to retry because
+      // this insert is its own implicit transaction (no enclosing db.transaction)
+      // and ON CONFLICT DO NOTHING makes it idempotent.
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+          await db.insert(schema.tokens).values(chunk).onConflictDoNothing()
+          break
+        } catch (err) {
+          if (isDeadlock(err) && attempt < 3) {
+            await new Promise(r => setTimeout(r, 50 * attempt))
+            continue
+          }
+          throw err
+        }
+      }
+    }
+    for (const v of valid) {
+      tokenCache.add(v.address)
+      if (tokenCache.size >= TOKEN_CACHE_MAX) tokenCache.clear()
+    }
+  }
+  return toFetch.length
+}
+
+// ── DEX pair token lookup ───────────────────────────────────────────
+const PAIR_ABI = [
+  'function token0() view returns (address)',
+  'function token1() view returns (address)',
+  'function factory() view returns (address)',
+]
+const FACTORY_ABI = ['function getPair(address, address) view returns (address)']
+
+/**
+ * A revert, or an empty return ethers cannot decode: the contract answered that it has no such function.
+ * Not a call the node refused: ethers reports a rate limit as CALL_EXCEPTION too, and remembering that
+ * as "not a pair" skipped every later swap on a real pair until the cache evicted it.
+ */
+function answeredNo(err: unknown): boolean {
+  if (isTransportError(err)) return false
+  return isError(err, 'CALL_EXCEPTION') || (isError(err, 'BAD_DATA') && err.value === '0x')
+}
+
+function v2PairReader(provider: JsonRpcProvider): V2PairReader {
+  return {
+    async pairInfo(pairAddress) {
+      const pair = new Contract(pairAddress, PAIR_ABI, provider)
+      try {
+        const [token0, token1, factory] = await Promise.all([pair.token0(), pair.token1(), pair.factory()])
+        return { token0: String(token0), token1: String(token1), factory: String(factory) }
+      } catch (err) {
+        if (answeredNo(err)) return null
+        throw err
+      }
+    },
+    async getPair(factory, tokenA, tokenB) {
+      return String(await new Contract(factory, FACTORY_ABI, provider).getPair(tokenA, tokenB))
+    },
+  }
+}
+
+/**
+ * Seed the pair cache from recent dex_trades (post-write-budget.ts warmPairs). Runs once at boot, in the background;
+ * a failure only means the cache starts cold, as it always did.
+ */
+export async function warmPairCache(): Promise<number> {
+  try {
+    const rows = Array.from(await getDb().execute(sql`
+      SELECT pair_address, min(LEAST(token_in, token_out)) AS token0, max(GREATEST(token_in, token_out)) AS token1, min(dex) AS dex
+      FROM dex_trades
+      WHERE block_number > (SELECT max(block_number) FROM dex_trades) - ${WARM_PAIR_BLOCKS}
+        AND pair_address IS NOT NULL AND token_in IS NOT NULL AND token_out IS NOT NULL
+      GROUP BY pair_address
+      LIMIT ${WARM_PAIR_MAX}
+    `)) as WarmPairRow[]
+    let added = 0
+    for (const [address, pair] of warmPairs(rows)) {
+      if (pairCache.has(address)) continue
+      if (pairCache.size >= PAIR_CACHE_MAX) break
+      pairCache.set(address, pair)
+      added++
+    }
+    console.log(`[dex] warmed the pair cache with ${added} pairs from recent dex_trades`)
+    return added
+  } catch (err) {
+    console.warn('[dex] pair cache warm-up failed, starting cold:', dbErrorMessage(err))
+    return 0
+  }
+}
+
+async function fetchPairTokens(pairAddress: string, provider: JsonRpcProvider): Promise<void> {
+  try {
+    const pair = await resolveV2Pair(pairAddress, V2_FACTORIES[getChainConfig().key], v2PairReader(provider))
+    if (pairCache.size >= PAIR_CACHE_MAX) {
+      pairCache.delete(pairCache.keys().next().value!)
+    }
+    pairCache.set(pairAddress, pair)
+  } catch {
+    // A read failed: nothing is remembered, and the pair is read again when it next swaps.
+  }
+}
+
+/**
+ * A receipt's success flag. `'0x1'` is success, `'0x0'` is failure, and nothing
+ * else is guessed at: the old `r.status === '0x1'` stored a missing or garbled
+ * status as a FAILED transaction, silently.
+ *
+ * A receipt with no `status` but a state `root` is pre-Byzantium (before block
+ * 4,370,000 on mainnet), which had no failure flag; it counts as success. A
+ * receipt with neither proves nothing, so this throws and rpc-failover retries
+ * the block on another endpoint (strictly above the first write).
+ */
+export function parseReceiptStatus(
+  r: { transactionHash?: string; status?: string | null; root?: string | null },
+  blockNumber: number,
+): boolean {
+  const s = r.status
+  if (s === undefined || s === null) {
+    if (typeof r.root === 'string' && r.root.length > 2) return true
+    throw new Error(`Block ${blockNumber} receipt for ${r.transactionHash} has neither status nor root`)
+  }
+  if (typeof s === 'string' && /^0x0*1$/i.test(s)) return true
+  if (typeof s === 'string' && /^0x0*$/i.test(s)) return false
+  throw new Error(`Block ${blockNumber} receipt for ${r.transactionHash} has unrecognised status ${JSON.stringify(s)}`)
+}
+
+/** Secondary field: a missing or malformed value falls back to tx.gasPrice, never throws. */
+function parseEffectiveGasPrice(v: unknown): bigint | undefined {
+  if (typeof v !== 'string' || !/^0x[0-9a-f]+$/i.test(v)) return undefined
+  return BigInt(v)
+}
+
+const HEX_QUANTITY = /^0x[0-9a-fA-F]+$/
+const TOPIC_RE = /^0x[0-9a-fA-F]{64}$/
+const ADDRESS_RE = /^0x[0-9a-fA-F]{40}$/
+const INT4_MAX = 0x7fffffff
+
+/**
+ * Check one receipt log's fields before anything is written. A missing, non-hex or
+ * out-of-int4 logIndex, or a topic or address of the wrong shape, used to pass
+ * through and only fail at the async transfer writer's INSERT, after the cursor
+ * had already moved past the block. The coalesced drain then retried forever with
+ * W frozen. Throwing here runs above the first write, so rpc-failover retries the
+ * block on another endpoint with nothing to roll back.
+ */
+function normalizeReceiptLog(l: { address: unknown; topics: unknown; data: string; logIndex: unknown }, where: string) {
+  const bad = (field: string, v: unknown) =>
+    new Error(`Malformed receipt log (${where}): invalid ${field} ${String(JSON.stringify(v)).slice(0, 80)}`)
+  const { address, topics, logIndex } = l
+  if (typeof logIndex !== 'string' || !HEX_QUANTITY.test(logIndex) || parseInt(logIndex, 16) > INT4_MAX) {
+    throw bad('logIndex', logIndex)
+  }
+  // EVM logs carry 0–4 topics (LOG0–LOG4), each exactly 32 bytes.
+  if (!Array.isArray(topics) || topics.length > 4 || !topics.every(t => typeof t === 'string' && TOPIC_RE.test(t))) {
+    throw bad('topics', topics)
+  }
+  if (typeof address !== 'string' || !ADDRESS_RE.test(address)) throw bad('address', address)
+  return { address: address.toLowerCase(), topics: topics as string[], data: l.data, index: parseInt(logIndex, 16) }
+}
+
+// ── eth_getBlockReceipts ─────────────────────────────────────────────
+// No auto-disable: all target chains (BSC, ETH mainnet) support this method on
+// every RPC we use. A failure here means a transient issue (rate-limit 429,
+// network blip) — we throw so the worker-pool catches it, marks the block
+// failed, sleeps 1s, and retries. Previously we auto-disabled after 3 failures
+// and silently dropped receipts for the rest of the process lifetime, which
+// meant token_transfers/dex_trades/tx_status stopped being recorded entirely.
+export async function fetchBlockReceipts(
+  provider: JsonRpcProvider,
+  blockNumber: number,
+): Promise<Array<{ txHash: string; receipt: NormalizedReceipt }>> {
+  const blockHex = '0x' + blockNumber.toString(16)
+  const raw = await provider.send('eth_getBlockReceipts', [blockHex]) as Array<{
+    transactionHash: string
+    status?: string | null
+    /** Pre-Byzantium receipts carry a state root instead of a status. */
+    root?: string | null
+    gasUsed: string
+    effectiveGasPrice?: string | null
+    logs: Array<{ address: string; topics: string[]; data: string; logIndex: string }>
+  }> | null
+
+  // A null response is NOT an empty block. Collapsing the two (`raw ?? []`) made
+  // an RPC that answered "I don't have this block" indistinguishable from one
+  // that answered "this block has no transactions" — and the difference is
+  // destructive, because writeTransferBlocks DELETEs a block's transfers before
+  // re-inserting whatever it was handed. Replaying a block against an endpoint
+  // that returned null therefore wiped good rows and inserted nothing.
+  //
+  // Throwing hands the block to rpc-failover, which retries it on another
+  // endpoint. This is strictly above the first write, so no partial state exists
+  // to roll back.
+  if (raw === null || raw === undefined) {
+    throw new Error(`Block ${blockNumber} receipts unavailable (null response)`)
+  }
+
+  const result: Array<{ txHash: string; receipt: NormalizedReceipt }> = []
+  for (const r of raw) {
+    result.push({
+      // Normalized HERE, once, at the boundary. assertReceiptCoverage compares
+      // case-insensitively, so without this a differently-cased hash would PASS
+      // coverage and then miss in receiptByTx — handing the transaction the
+      // default status=true / gasUsed=0 instead of its real receipt, silently.
+      // The raw hash also feeds transfer and dex rows, whose SQL unique keys are
+      // case-SENSITIVE, so a case variant could slip past them too.
+      txHash: r.transactionHash.toLowerCase(),
+      receipt: {
+        status: parseReceiptStatus(r, blockNumber),
+        gasUsed: BigInt(r.gasUsed),
+        effectiveGasPrice: parseEffectiveGasPrice(r.effectiveGasPrice),
+        logs: r.logs.map((l, i) => normalizeReceiptLog(l, `block ${blockNumber} tx ${r.transactionHash} log ${i}`)),
+      },
+    })
+  }
+  return result
+}

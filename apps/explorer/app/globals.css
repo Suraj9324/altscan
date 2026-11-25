@@ -1,0 +1,1140 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Ledger Tape tokens. The chain accents arrive on <html> (app/layout.tsx, from chain-config) as
+   --acc-l / --acc-ink-l / --acc-t-l / --acc-on-l (light) and --acc-d / --acc-ink-d / --acc-t-d /
+   --acc-on-d (dark); --acc / --acc-ink / --acc-t / --acc-on below pick one set per scheme.
+   Dark follows prefers-color-scheme (no toggle): it is only a swap of these variables. */
+:root {
+  color-scheme: light dark;
+  --ink: #101014;
+  --ink2: #3b3b45;
+  --mut: #6c6c77;
+  --faint: #b4b4c0;
+  --bg: #fbfbfc;
+  --card: #ffffff;
+  --hair: #e7e7ee;
+  --hair2: #f0f0f5;
+  --hair3: #cfcfd8;
+  /* Border of the three floating panels (More, NetworkSwitcher, the copy popover). WCAG 1.4.11 wants
+     3:1 for a component boundary; no existing token sits between 3:1 and 4:1 (--hair3 1.55, --faint
+     2.05, --mut 5.19), so this is its own literal: #8d8d99 is 3.28:1 on --card (#fff) and 3.17:1 on
+     --bg (#fbfbfc). The old --hair edge was 1.23:1. */
+  --pop-line: #8d8d99;
+  --live: #15803d;
+  --liveT: #eaf6ee;
+  --warn: #9a4a32;
+  --warnT: #fff8f5;
+  /* The footer's ad band: dark in both schemes (the strip's text is light), unlike --ink, which
+     turns near-white in dark. */
+  --band: #101014;
+  --acc: var(--acc-l);
+  --acc-ink: var(--acc-ink-l);
+  --acc-t: var(--acc-t-l);
+  --acc-on: var(--acc-on-l);
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --ink: #ededf2;
+    --ink2: #b9b9c6;
+    --mut: #8a8a98;
+    --faint: #4a4a56;
+    --bg: #0b0b0f;
+    --card: #121218;
+    --hair: #23232c;
+    --hair2: #1b1b22;
+    --hair3: #34343f;
+    /* #646470: 3.20:1 on --card (#121218), 3.37:1 on --bg (#0b0b0f); the old --hair3 edge was 1.52:1. */
+    --pop-line: #646470;
+    --live: #34c46a;
+    --liveT: #12261a;
+    --warn: #f0a58c;
+    --warnT: #2a1712;
+    --band: #1b1b22;
+    --acc: var(--acc-d);
+    --acc-ink: var(--acc-ink-d);
+    --acc-t: var(--acc-t-d);
+    --acc-on: var(--acc-on-d);
+  }
+}
+
+@layer base {
+  /* `clip`, not `hidden`: hidden on both html and body makes body a scroll
+     container and breaks the sticky header. */
+  html,
+  body {
+    overflow-x: clip;
+  }
+  html {
+    -webkit-text-size-adjust: 100%;
+  }
+  body {
+    @apply font-sans min-h-screen flex flex-col;
+    background: var(--bg);
+    color: var(--ink);
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+  /* Accessible focus ring for keyboard navigation */
+  *:focus-visible {
+    outline: 2px solid var(--acc-ink);
+    outline-offset: 2px;
+  }
+}
+
+@layer components {
+  /* Kicker: mono caption above a heading or over a column. */
+  .k {
+    font-family: var(--font-mono), ui-monospace, Menlo, monospace;
+    font-size: 12px;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--mut);
+  }
+  /* NetworkSwitcher swatch. It shows BOTH chains' accents, so it cannot use --acc: each swatch
+     carries its own light and dark pair (--nm-*) inline, and the scheme picks one. */
+  .net-mark {
+    background: var(--nm-l);
+    color: var(--nm-on-l);
+  }
+  @media (prefers-color-scheme: dark) {
+    .net-mark {
+      background: var(--nm-d);
+      color: var(--nm-on-d);
+    }
+  }
+  /* Forced colours (Windows High Contrast) drop the swatch fill, so only the bare icon would be left.
+     A border survives, in a system colour; the icon keeps its forced text colour inside it. */
+  @media (forced-colors: active) {
+    .net-mark {
+      border: 1px solid CanvasText;
+    }
+  }
+  /* Hairline divider (<hr class="rule"> or an empty <div class="rule">). */
+  .rule {
+    height: 1px;
+    border: 0;
+    background: var(--hair);
+  }
+  /* Fact strip: hairline-divided cells, 2 columns on phones, --cols (default 4) from md up.
+     Set a different count with the `[--cols:5]` class. */
+  .ledger {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 1px;
+    background: var(--hair);
+    border: 1px solid var(--hair);
+    border-radius: 12px;
+    overflow: hidden;
+  }
+  .ledger > * {
+    background: var(--card);
+    padding: 14px 16px;
+    min-width: 0;
+  }
+  .ledger > :last-child:nth-child(odd) {
+    grid-column: 1 / -1;
+  }
+  @media (min-width: 768px) {
+    .ledger {
+      grid-template-columns: repeat(var(--cols, 4), minmax(0, 1fr));
+    }
+    .ledger > :last-child:nth-child(odd) {
+      grid-column: auto;
+    }
+  }
+  /* Right-edge fade on a row that scrolls sideways (the address tab bar): says there is more.
+     Give the row pr-6 so its last item can scroll clear of the fade, and apply it with a
+     max-* variant at the widths where the row actually overflows. */
+  .fade-r {
+    -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 24px), transparent);
+    mask-image: linear-gradient(to right, #000 calc(100% - 24px), transparent);
+  }
+  /* Keyboard focus on an item in the fade zone would otherwise be dimmed, and on the scroller
+     itself (a focusable region) the mask would clip its focus ring. */
+  .fade-r:focus-visible,
+  .fade-r:has(:focus-visible) {
+    -webkit-mask-image: none;
+    mask-image: none;
+  }
+}
+
+/* Named class lists. Markup that repeats a long utility list ships it twice per page (the HTML and
+   the RSC payload that repeats it), so the lists shared across the shell, the home page and the two
+   list tables live here under one short name. Each is an @apply of the utilities it replaced, so the
+   declarations are the same ones; a utility on the same element still wins (components come first).
+   Not the same trick: joining visible `{a} {b}` text into one template string drops React's `<!-- -->`
+   separators but moves glyphs by 1/64px (text widths are summed per text node), so it is not pixel-identical. */
+@layer components {
+  /* The site chrome: the one <main>, <header> and <footer> of the page shell. Classes, not element
+     rules, so a <header> or <footer> inside a page section does not inherit them. */
+  .mn {
+    @apply flex-1 scroll-mt-32 focus:outline-none;
+  }
+  .hd {
+    @apply sticky top-0 z-50 border-t-[3px] border-t-acc border-b border-b-hair bg-card/90 backdrop-blur-md;
+  }
+  .ft {
+    @apply bg-card border-t border-hair text-mut text-sm mt-auto;
+  }
+  .card {
+    @apply bg-card rounded-xl border border-hair overflow-hidden;
+  }
+  /* The chain mark in a rounded square (header, footer). */
+  .mark {
+    @apply flex h-8 w-8 shrink-0 items-center justify-center rounded-[3px] bg-acc text-acc-on;
+  }
+  /* First tab stop: hidden until focused, then pinned above the sticky header (z-50). */
+  .skip {
+    @apply sr-only focus:not-sr-only focus:fixed focus:left-3 focus:top-3 focus:z-[60] focus:rounded-[9px] focus:border focus:border-hair focus:bg-card focus:px-3 focus:py-2 focus:text-sm focus:font-medium focus:text-ink focus:ring-2 focus:ring-acc;
+  }
+  /* Status chip (components/ui/Badge): .badge is the neutral one, a variant recolours it. */
+  .badge {
+    @apply inline-block px-2 py-0.5 rounded-[4px] font-mono text-[11px] font-medium uppercase tracking-[0.04em] bg-hair2 text-ink2;
+  }
+  .badge-ok {
+    @apply bg-live-t text-live;
+  }
+  .badge-bad {
+    @apply bg-warn-t text-warn;
+  }
+  .badge-acc {
+    @apply bg-acc-t text-acc-ink;
+  }
+}
+
+/* Header (components/layout/Header, NetworkSwitcher, SearchBar). The nav's links, the switcher's
+   button parts and the search form's two controls are styled from their container, so none of them
+   carries a class. The active nav link is the one with aria-current. */
+@layer components {
+  .brand {
+    @apply flex items-center gap-2.5 shrink-0;
+  }
+  .brand-n {
+    @apply font-mono font-semibold text-[15px] tracking-tight block;
+  }
+  .brand-t {
+    @apply text-[11px] text-mut hidden sm:block leading-none mt-0.5;
+  }
+  .nav {
+    @apply hidden lg:flex items-center gap-0.5 text-[13px] font-medium flex-1 justify-end;
+  }
+  .nav > a,
+  .nav-m > summary {
+    @apply px-2 py-2 border-b-2 transition-colors whitespace-nowrap text-ink2 hover:text-ink border-transparent;
+  }
+  .nav > a[aria-current="page"],
+  .nav-m > summary[data-on] {
+    @apply text-acc-ink border-acc font-semibold;
+  }
+  /* More: the nav's <details>. Its summary is styled as the nav's other items, with the marker
+     hidden, and is active when the current page is one of its links. */
+  .nav-m {
+    @apply relative;
+  }
+  .nav-m > summary {
+    @apply flex items-center gap-1 list-none cursor-pointer select-none;
+  }
+  .nav-m > summary::-webkit-details-marker {
+    display: none;
+  }
+  .nav-m > summary > svg {
+    @apply w-3 h-3 text-mut transition-transform duration-150;
+  }
+  .nav-m[open] > summary > svg {
+    @apply rotate-180;
+  }
+  .nav-p {
+    @apply absolute right-0 top-full mt-2 w-48 py-1 rounded-xl border border-pop-line bg-card shadow-[0_10px_30px_rgba(16,16,20,0.12)] overflow-hidden z-50;
+  }
+  .nav-p a {
+    @apply block px-3 py-2.5 border-l-2 border-l-transparent text-ink2 hover:text-ink hover:bg-hair2 transition-colors;
+  }
+  .nav-p a[aria-current="page"] {
+    @apply border-l-acc text-acc-ink font-semibold;
+  }
+  .burger {
+    @apply lg:hidden ml-auto flex flex-col justify-center items-center w-9 h-9 gap-1.5 rounded-[9px] border border-hair bg-card hover:border-hair3 transition-colors;
+  }
+  .burger span {
+    @apply block h-0.5 w-5 bg-current rounded transition-all duration-200;
+  }
+  .hdr-s {
+    @apply basis-full xl:basis-auto xl:w-[19rem] xl:shrink-0;
+  }
+  .ns {
+    @apply relative shrink-0;
+  }
+  .ns > button {
+    @apply flex items-center gap-2 h-8 px-3 rounded-full border border-hair bg-card hover:border-hair3 transition-colors font-mono text-xs font-medium text-ink;
+  }
+  .ns > button > span {
+    @apply w-2 h-2 rounded-[2px] bg-acc shrink-0;
+  }
+  .ns > button > svg {
+    @apply w-3 h-3 text-mut transition-transform duration-150;
+  }
+  .sb {
+    @apply relative w-full flex gap-2;
+  }
+  .sb input {
+    @apply flex-1 min-w-0 rounded-[9px] border border-hair bg-card font-mono text-ink placeholder:text-mut hover:border-hair3 h-9 px-3 text-[13px];
+  }
+  .sb button {
+    @apply shrink-0 rounded-[9px] bg-ink text-card font-semibold hover:opacity-90 transition-opacity h-9 px-4 text-[13px];
+  }
+  /* The typeahead (components/layout/SearchSuggest): an overlay under the field, so opening it shifts nothing. */
+  .sb-list {
+    @apply absolute left-0 right-0 top-full mt-1.5 z-50 max-h-[min(24rem,70dvh)] overflow-y-auto py-1 rounded-xl border border-pop-line bg-card shadow-[0_10px_30px_rgba(16,16,20,0.12)];
+  }
+  .sb-list li {
+    @apply px-3 py-2 border-l-2 border-l-transparent text-[13px] text-ink2 cursor-pointer;
+  }
+  .sb-list li[aria-selected="true"] {
+    @apply border-l-acc bg-hair2 text-ink;
+  }
+  /* Large type only from sm up: on a phone the hero field keeps the header's size, so the
+     placeholder fits beside the button. */
+  .sb-lg input {
+    @apply h-12 sm:px-4 sm:text-[15px];
+  }
+  .sb-lg button {
+    @apply h-12 sm:px-6 sm:text-[15px];
+  }
+}
+
+/* Home page (app/page.tsx). */
+@layer components {
+  .hero {
+    @apply max-w-7xl mx-auto px-4 pt-10 pb-8 md:pt-14 md:pb-10;
+  }
+  .hero-h {
+    @apply mt-3 max-w-5xl text-balance text-ink font-bold tracking-[-0.035em] leading-[1.05] text-[clamp(30px,4.4vw,56px)];
+  }
+  .hero-p {
+    @apply mt-4 text-[15px] text-ink2;
+  }
+  .stat-v {
+    @apply mt-1 font-mono text-lg md:text-xl text-ink;
+  }
+  .stat-s {
+    @apply mt-0.5 font-mono text-xs;
+  }
+  .two {
+    @apply grid md:grid-cols-2 gap-6;
+  }
+  .sec {
+    @apply flex justify-between items-center mb-3;
+  }
+  .h2 {
+    @apply text-lg font-[650] tracking-[-0.02em] text-ink;
+  }
+  .lk-u {
+    @apply text-acc-ink underline underline-offset-2;
+  }
+}
+
+/* Footer (components/layout/Footer): the same, for the links row. */
+@layer components {
+  .ft-in {
+    @apply max-w-7xl mx-auto px-4 py-5 flex flex-col md:flex-row md:flex-wrap items-start md:items-center justify-between gap-4;
+  }
+  .ft-b {
+    @apply font-mono text-ink font-semibold text-[15px] leading-tight;
+  }
+  .ft-a {
+    @apply font-mono text-acc-ink hover:underline font-semibold py-1 inline-block;
+  }
+  .ft-a2 {
+    @apply font-mono text-acc-ink hover:underline text-xs font-medium mt-1.5 block;
+  }
+  .ft-l {
+    @apply flex flex-wrap gap-x-3 gap-y-1 font-mono text-[12.5px];
+  }
+  .ft-l a {
+    @apply text-mut hover:text-ink transition-colors py-2;
+  }
+}
+
+/* Data tables (components/blocks/BlockTable, components/transactions/TxTable) */
+@layer components {
+  /* One class on the <table> instead of the same utilities on every cell: these tables run to
+     50 rows, and per-cell class lists made React split the page payload into a row per <tr>. */
+  .dt {
+    width: 100%;
+    font-family: var(--font-mono), ui-monospace, Menlo, monospace;
+    font-size: 13px;
+  }
+  .dt thead {
+    background: var(--bg);
+    border-bottom: 1px solid var(--hair);
+  }
+  /* :where() keeps th/td at class specificity, so a utility on a cell (text-right, py-8) wins
+     instead of silently losing to these defaults. */
+  .dt :where(th) {
+    text-align: left;
+    padding: 8px 12px;
+    font-size: 11px;
+    font-weight: 500;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--mut);
+  }
+  .dt :where(td) {
+    padding: 8px 12px;
+  }
+  .dt tbody tr + tr {
+    border-top: 1px solid var(--hair);
+  }
+  .dt tbody tr {
+    transition: background-color 0.15s;
+  }
+  .dt tbody tr:hover {
+    background: var(--bg);
+  }
+  @media (min-width: 640px) {
+    .dt :where(th, td) {
+      padding-inline: 16px;
+    }
+  }
+  /* `dt-2l` (token Top Holders): below sm every row is exactly two lines tall (the floor sits just
+     above a natural two-line row: 2 lines + 16px of padding + the collapsed border), so whether a
+     cell wraps (a balance, a short address) cannot change the row's height. The page swaps the SSR
+     estimate for the live holders over it, and their digits differ; without the floor the table
+     moved by up to a line a row. A row that wraps to three lines still grows. */
+  @media (max-width: 639.98px) {
+    .dt-2l tbody tr {
+      height: calc(2lh + 18px);
+    }
+  }
+  /* `dt-a` (BlockTable, TxTable): every link in the table is an accent link, so the cells carry no
+     per-link colour or hover classes. :where() keeps it at the specificity of the utilities it
+     replaced, so one on a link (font-medium) still applies. */
+  .dt-a :where(a) {
+    color: var(--acc-ink);
+  }
+  .dt-a :where(a):hover {
+    text-decoration-line: underline;
+  }
+  /* `dt-x` (with `fade-r`, on the scrolling box around a `dt` with a min-width: the API
+     parameter tables): the right-edge fade hints at the clipped column only below the width where the
+     table scrolls (it is 36rem, so ~650px; above that the table fits and the fade would just dim
+     its last column), and the last column keeps as much padding as the fade is wide, so at the
+     end of the scroll nothing sits in it. */
+  @media (min-width: 651px) {
+    .dt-x {
+      -webkit-mask-image: none;
+      mask-image: none;
+    }
+  }
+  @media (max-width: 650.98px) {
+    .dt-x .dt :where(th, td):last-child {
+      padding-right: 24px;
+    }
+  }
+}
+
+/* Gas-used bar under a block's Gas Used (components/blocks/BlockTable, /blocks only): a fill on a
+   track, drawn as two background layers, so the whole bar is one empty span whose width comes from
+   the row's inline --g. */
+@layer components {
+  .gbar {
+    display: block;
+    width: 96px;
+    height: 4px;
+    margin-top: 4px;
+    border-radius: 9999px;
+    background: linear-gradient(var(--acc), var(--acc)) 0 0 / var(--g, 0%) 100% no-repeat, var(--acc-t);
+  }
+  /* Forced colours: the fill is the bar's whole meaning, so it is redrawn in system colours (Highlight
+     on Canvas, CanvasText outline, as the block tape's tiles are). */
+  @media (forced-colors: active) {
+    .gbar {
+      forced-color-adjust: none;
+      background: linear-gradient(Highlight, Highlight) 0 0 / var(--g, 0%) 100% no-repeat, Canvas;
+      outline: 1px solid CanvasText;
+    }
+  }
+}
+
+/* Transaction rows on phones (components/transactions/TxTable). Under 640px each row is a
+   three-line card laid out from the same cells as the desktop table, so there is no second set of
+   markup: 1) status dot, hash, age  2) from -> to  3) value and its unit. Cells are told apart by
+   position (hash, age, from, to, value, status), so keep that order in TxTable.
+   Two more tables take the same pattern, each with its own cell order (the same skeleton, only the
+   grid differs): `dt-ad`, an address's transactions (app/address/[address]/page.tsx and TxnsLazy.tsx:
+   hash, age, from/to or summary, value), and `dt-tk`, the /token list (#, token, symbol, indexed
+   holders, total supply). */
+@layer components {
+  /* `compact` (the homepage) has no To column on desktop; the cell is there for phones. */
+  @media (min-width: 640px) {
+    .dt-tx-c :is(th, td):nth-child(4) {
+      display: none;
+    }
+  }
+  @media (max-width: 639.98px) {
+    .dt-tx,
+    .dt-tx tbody,
+    .dt-ad,
+    .dt-ad tbody,
+    .dt-tk,
+    .dt-tk tbody {
+      display: block;
+    }
+    .dt-tx tbody tr,
+    .dt-ad tbody tr,
+    .dt-tk tbody tr {
+      display: grid;
+      column-gap: 8px;
+      row-gap: 2px;
+      align-items: center;
+      padding: 10px 12px;
+    }
+    .dt-tx tbody tr {
+      grid-template-columns: 10px fit-content(55%) minmax(0, 1fr) auto;
+    }
+    .dt-tx td,
+    .dt-ad td,
+    .dt-tk td {
+      padding: 0;
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .dt-tx td:nth-child(1) {
+      grid-area: 1 / 2 / 2 / 4;
+    }
+    .dt-tx td:nth-child(2) {
+      grid-area: 1 / 4;
+      text-align: right;
+    }
+    .dt-tx td:nth-child(3) {
+      grid-area: 2 / 2;
+    }
+    .dt-tx td:nth-child(4) {
+      grid-area: 2 / 3 / 3 / 5;
+    }
+    .dt-tx td:nth-child(5) {
+      grid-area: 3 / 2 / 4 / 5;
+    }
+    .dt-tx td:nth-child(3),
+    .dt-tx td:nth-child(4),
+    .dt-tx td:nth-child(5) {
+      font-size: 12px;
+    }
+    .dt-tx td:nth-child(5) {
+      color: var(--ink2);
+    }
+    /* The arrow is decoration: the empty alternative keeps it out of the accessible name. */
+    .dt-tx td:nth-child(4)::before {
+      content: "\2192";
+      content: "\2192" / "";
+      margin-right: 6px;
+      color: var(--mut);
+    }
+    /* Status: a dot, filled for success and a ring for failure, so the two differ by shape and not
+       only by colour. The badge text stays in the cell, visually hidden, as the label. A tx whose
+       status is unknown has nothing to show. */
+    .dt-tx td:nth-child(6) {
+      grid-area: 1 / 1;
+    }
+    .dt-tx td:nth-child(6):not(.tx-ok, .tx-bad) {
+      display: none;
+    }
+    .dt-tx .tx-ok {
+      color: var(--live);
+    }
+    .dt-tx .tx-bad {
+      color: var(--warn);
+    }
+    .dt-tx td:nth-child(6)::before {
+      content: "";
+      display: block;
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background: currentColor;
+    }
+    .dt-tx td.tx-bad:nth-child(6)::before {
+      background: none;
+      box-shadow: inset 0 0 0 2px currentColor;
+    }
+    /* Forced colours (Windows High Contrast) drop background-colour fills and box-shadows, so the dot
+       would vanish. A border survives, in a system colour: 5px on the 10px box is a solid disc
+       (success), 2px is a ring (failure), keeping the shape difference. */
+    @media (forced-colors: active) {
+      .dt-tx td:nth-child(6)::before {
+        box-sizing: border-box;
+        border: 5px solid CanvasText;
+      }
+      .dt-tx td.tx-bad:nth-child(6)::before {
+        border-width: 2px;
+      }
+    }
+    .dt-tx td:nth-child(6) > * {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      overflow: hidden;
+      clip-path: inset(50%);
+      white-space: nowrap;
+    }
+    /* `dt-ad`: 1) hash, age  2) from/to or summary  3) value and its unit. */
+    .dt-ad tbody tr {
+      grid-template-columns: minmax(0, 1fr) auto;
+    }
+    .dt-ad td:nth-child(1) {
+      grid-area: 1 / 1;
+    }
+    .dt-ad td:nth-child(2) {
+      grid-area: 1 / 2;
+      text-align: right;
+    }
+    .dt-ad td:nth-child(3) {
+      grid-area: 2 / 1 / 3 / 3;
+    }
+    .dt-ad td:nth-child(4) {
+      grid-area: 3 / 1 / 4 / 3;
+    }
+    .dt-ad td:nth-child(3),
+    .dt-ad td:nth-child(4) {
+      font-size: 12px;
+    }
+    .dt-ad td:nth-child(4) {
+      color: var(--ink2);
+    }
+    /* `dt-tk`: 1) rank, name (and a lookalike badge), symbol  2) indexed holders  3) total supply.
+       The headers are visually hidden here, so the two figures carry their own label after them
+       (the holder count is never shown bare: lib/holder-labels.ts). The name may wrap, so the badge
+       is never the part that is cut off. */
+    .dt-tk tbody tr {
+      grid-template-columns: 24px minmax(0, 1fr) fit-content(35%);
+    }
+    .dt-tk td:nth-child(1) {
+      grid-area: 1 / 1;
+    }
+    .dt-tk td:nth-child(2) {
+      grid-area: 1 / 2;
+      white-space: normal;
+      overflow-wrap: anywhere;
+    }
+    .dt-tk td:nth-child(3) {
+      grid-area: 1 / 3;
+      text-align: right;
+    }
+    .dt-tk td:nth-child(4) {
+      grid-area: 2 / 2 / 3 / 4;
+    }
+    .dt-tk td:nth-child(5) {
+      grid-area: 3 / 2 / 4 / 4;
+    }
+    .dt-tk td:nth-child(4),
+    .dt-tk td:nth-child(5) {
+      font-size: 12px;
+    }
+    .dt-tk td:nth-child(4) {
+      color: var(--ink2);
+    }
+    .dt-tk td:nth-child(4)::after {
+      content: " indexed holders";
+      color: var(--mut);
+    }
+    .dt-tk td:nth-child(5)::after {
+      content: " total supply";
+      color: var(--mut);
+    }
+    /* The one-cell "No tokens indexed yet." row takes the whole card, not the rank column. */
+    .dt-tk td[colspan] {
+      grid-column: 1 / -1;
+      white-space: normal;
+    }
+  }
+}
+
+/* Tape primitives (.tp-*): the band, header, track, row, tile, ring, label and legend that the block
+   tape (components/home/BlockTape.tsx), the block / tx strip (components/tape/BlockStrip.tsx), the tile
+   strips of /gas, /validators, /dex and a token's holders (components/tape/TileStrip.tsx) and, for the
+   band chrome, the address ledger (components/tape/AddressLedger.tsx) are all drawn from.
+   Each component adds only what is its own: the tape its gaps and clamped label (.tp-gap, .bt-chip),
+   the strip its separators, failed hatch and anchored label (.bs-*), the ledger its axis (.ldg-*).
+   A tile's width is pure CSS and never measured: tiles are flex items whose flex-grow is their --w
+   (the tape: transactions; the strip: gas used in thousands), so a row is exactly the content width
+   at every viewport and never scrolls. --f is the fill height (a percent). Tiles are bare
+   <li><a> / <i> (selectors, not classes) to keep the homepage's ~40 of them small in the HTML: the
+   page's streamed content must stay inside the first network chunk. */
+@layer components {
+  .tp-box {
+    @apply bg-card border-y border-hair;
+  }
+  .tp-head {
+    @apply max-w-7xl mx-auto px-4 pt-3 flex items-center justify-between gap-4 font-mono text-xs text-mut;
+    min-height: var(--tp-head-h, 38px);
+  }
+  .tp-dot {
+    @apply mr-2 w-[9px] h-[9px] shrink-0 rounded-[2px] bg-acc;
+  }
+  .tp-stats {
+    @apply flex gap-3 whitespace-nowrap;
+  }
+  .tp-rate {
+    @apply hidden min-[480px]:inline;
+  }
+  .tp-leg {
+    @apply max-w-7xl mx-auto px-4 py-3 min-h-[60px] sm:min-h-[44px] font-mono text-xs leading-[18px] text-mut;
+  }
+  .tp-track {
+    height: 64px;
+  }
+  /* A ringed tile has a label floating over it: taller track and row padding make room for it. */
+  .tp-track.tp-cur {
+    height: 92px;
+  }
+  .tp-row {
+    position: relative;
+    display: flex;
+    height: 100%;
+    padding: 8px 0 10px;
+  }
+  .tp-cur .tp-row {
+    padding-top: 34px;
+  }
+  .tp-row > * {
+    flex: var(--w) 1 0;
+    min-width: 0;
+  }
+  /* The ringed tile never shrinks under 3px, so it cannot vanish. */
+  .tp-row > .c {
+    min-width: 3px;
+  }
+  .tp-row :is(i, a) {
+    position: relative;
+    background: var(--acc-t);
+  }
+  /* Fill. */
+  .tp-row :is(i, a)::before {
+    content: "";
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    height: var(--f);
+    background: var(--acc);
+  }
+  .tp-row a:hover,
+  .tp-row a[aria-current],
+  .tp-row > i.c,
+  .tp-gap :is(a, i)[data-hot] {
+    z-index: 1;
+    outline: 2px solid var(--ink);
+    outline-offset: 1px;
+  }
+  .tp-row a:focus-visible {
+    z-index: 1;
+  }
+  /* The ringed tile's ink outline would hide the global focus ring, so draw the ring outside it. */
+  .tp-row a[aria-current]:focus-visible {
+    box-shadow: 0 0 0 4px var(--card), 0 0 0 6px var(--acc-ink);
+  }
+  /* Label over a tile (the ringed tx, the ringed block). Placement is the component's own. */
+  .tp-chip {
+    position: absolute;
+    padding: 1px 6px;
+    border-radius: 4px;
+    background: var(--ink);
+    color: var(--card);
+    font-family: var(--font-mono), ui-monospace, Menlo, monospace;
+    font-size: 11px;
+    font-style: normal;
+    white-space: nowrap;
+    pointer-events: none;
+  }
+  @media (min-width: 768px) {
+    .tp-track {
+      height: 84px;
+    }
+    .tp-track.tp-cur {
+      height: 112px;
+    }
+  }
+  /* Forced colours (Windows High Contrast) drop background colours, and the tile fill is the data
+     (fill = gas used / gas price), so the whole tape would vanish. The fill becomes a Highlight
+     block, the label a CanvasText one; the ring is an outline and survives. The block tape's tiles
+     (.tp-gap) also get a CanvasText outline from ::after (absolute, so no layout change), so empty
+     vs full still reads; the strip draws its own edges (.bs-*). */
+  @media (forced-colors: active) {
+    .tp-dot {
+      forced-color-adjust: none;
+      background-color: CanvasText;
+    }
+    .tp-row :is(i, a)::before {
+      forced-color-adjust: none;
+      background: Highlight;
+    }
+    .tp-chip {
+      forced-color-adjust: none;
+      background: CanvasText;
+      color: Canvas;
+    }
+    .tp-gap :is(a, i)::after {
+      content: "";
+      position: absolute;
+      inset: 0;
+      border: 1px solid CanvasText;
+      border-radius: inherit;
+    }
+  }
+}
+
+/* Block tape (components/home/BlockTape.tsx) on the primitives: rounded tiles 2px apart, none under
+   2px wide (an empty block stays visible), and the ringed block's label. The label is placed by --q
+   (its tile's centre as a fraction of the row) and shifted left by the same fraction of its own
+   width: at 0 it starts at the row's left edge, at 1 it ends at the right edge, in between it sits
+   over its tile. So it is inside the track at every width, wherever the block is. --q is computed
+   by the page (lib/tape.ts layoutTiles, the flexbox below modelled with its floors) for two tracks,
+   --p-sm for a 375px phone (343px) and --p for a 1440px desktop (1248px), so no layout is measured
+   in the browser; the `sm` breakpoint picks between them (about where the two are equally far off for
+   a tape whose floors engage). Every cell is a real block: there are no placeholder cells, so
+   nothing is faded. */
+@layer components {
+  .tp-gap {
+    gap: 2px;
+  }
+  .tp-gap > li {
+    display: flex;
+    min-width: 2px;
+  }
+  .tp-gap :is(a, i) {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    border-radius: 3px;
+  }
+  .bt-chip {
+    --q: var(--p-sm, var(--p));   /* HTML cached by the previous build carries --p only */
+    left: calc(var(--q) * 100%);
+    bottom: calc(100% - 27px);
+    transform: translateX(calc(var(--q) * -100%));
+  }
+  @media (min-width: 640px) {
+    .bt-chip {
+      --q: var(--p);
+    }
+  }
+  /* The label is always inside the row (see above). A pointer at the same --q of the label's OWN width
+     points at the tile: label left = q * (row - label), so pointer = label left + q * label = q * row,
+     the tile's centre. That is exact at the two reference tracks (the tile's flexbox, floors and gaps
+     included); between them it is approximate, and for a tape whose floors engage (many near-empty
+     blocks) it can be tens of px off at the widths furthest from both. It stays 4px inside the label
+     (half its own width), and takes the label's background, so forced colours need no rule. */
+  .bt-chip::after {
+    content: "";
+    position: absolute;
+    top: 100%;
+    left: clamp(4px, calc(var(--q) * 100%), calc(100% - 4px));
+    width: 8px;
+    height: 4px;
+    margin-left: -4px;
+    background: inherit;
+    clip-path: polygon(0 0, 100% 0, 50% 100%);
+  }
+}
+
+/* Block strip (components/tape/BlockStrip.tsx): the txs of ONE block, on the primitives. flex-grow =
+   gas used in thousands (--w), fill = gas price (--f), no gaps and min-width 0 so the strip is
+   exactly the content width at every viewport; a card-coloured edge is the separator, so dense runs
+   of 21k-gas transfers read as texture. The edge is 1px but never more than 45% of its tile: a
+   phone-width dense block has tiles under 1px, and a fixed 1px edge would paint over them and leave
+   a hole. It is a pseudo-element, not a border or inset shadow, so it adds no layout floor per tile.
+   Only the ringed (.c) tile keeps a floor width (3px, so it cannot vanish). A failed (.x) tile is
+   exactly its share like any other: a floor on every failed tile would overflow a block with more
+   failed txs than content pixels (145 x 2px > 288px at 320px). */
+@layer components {
+  .bs-row > i::after {
+    content: "";
+    position: absolute;
+    top: 0;
+    right: 0;
+    bottom: 0;
+    width: min(1px, 45%);
+    background: var(--card);
+  }
+  .bs-row > i.x {
+    background: repeating-linear-gradient(135deg, var(--warn) 0 1.5px, transparent 1.5px 4px);
+  }
+  .bs-row > i.x::before {
+    display: none;
+  }
+  .bs-chip {
+    right: 0;
+    bottom: calc(100% + 7px);
+  }
+  .bs-chip.l {
+    right: auto;
+    left: 0;
+  }
+  /* Forced colours: a CanvasText edge per tile (the ::after, so no border widens a tile past its
+     share), failed tiles keep a CanvasText hatch. A ringed failed tile inherits
+     forced-color-adjust: none from .x, so the UA no longer recolours its outline: say CanvasText. */
+  @media (forced-colors: active) {
+    .bs-row > i::after {
+      forced-color-adjust: none;
+      background: CanvasText;
+    }
+    .bs-row > i.x {
+      forced-color-adjust: none;
+      background: repeating-linear-gradient(135deg, CanvasText 0 1.5px, Canvas 1.5px 4px);
+    }
+    .bs-row > i.c {
+      outline-color: CanvasText;
+    }
+  }
+}
+
+/* Address ledger (components/tape/AddressLedger.tsx): a page of an address's transactions, on the
+   primitives' band chrome (.tp-head, .tp-dot, .tp-rate, .tp-leg). Tiles sit above (received) or
+   below (sent) a hairline axis; flex-grow = 1 + log2(1 + seconds since the previous one); solid =
+   native value, outlined (.o) = tokens or calls; .s = provider-flagged spam. On phones the head
+   stacks its two cells (the title and the totals do not fit side by side in 256px without
+   truncating the title to a few letters); the loading shell has the same two cells. */
+@layer components {
+  .ldg {
+    @apply mb-4 rounded-xl border border-hair bg-card;
+    --tp-head-h: 30px;
+  }
+  .ldg-row {
+    position: relative;
+    display: flex;
+    gap: 2px;
+    height: 84px;
+    margin: 10px 16px 0;
+  }
+  .ldg-row::after {
+    content: "";
+    position: absolute;
+    inset-inline: 0;
+    top: 50%;
+    border-top: 1px solid var(--hair3);
+  }
+  .ldg-row > i {
+    position: relative;
+    flex: var(--w) 1 0;
+    min-width: 4px;
+  }
+  .ldg-row > i::before {
+    content: "";
+    position: absolute;
+    inset-inline: 0;
+    height: calc(50% - 4px);
+    border-radius: 2px;
+  }
+  .ldg-row > .in::before {
+    bottom: calc(50% + 2px);
+    background: var(--acc);
+  }
+  .ldg-row > .out::before {
+    top: calc(50% + 2px);
+    background: var(--ink);
+  }
+  .ldg-row > .in.o::before {
+    background: var(--acc-t);
+    box-shadow: inset 0 0 0 1.5px var(--acc);
+  }
+  .ldg-row > .out.o::before {
+    background: var(--hair2);
+    box-shadow: inset 0 0 0 1.5px var(--ink2);
+  }
+  .ldg-row > .s {
+    opacity: 0.3;
+  }
+  @media (max-width: 639px) {
+    .ldg-head {
+      flex-direction: column;
+      align-items: flex-start;
+      gap: 2px;
+    }
+    .ldg-row {
+      gap: 1px;
+    }
+    .ldg-row > i {
+      min-width: 2px;
+    }
+  }
+  @media (forced-colors: active) {
+    .ldg-row::after {
+      border-top-color: CanvasText;
+    }
+    .ldg-row > i::before {
+      forced-color-adjust: none;
+    }
+    .ldg-row > .in::before {
+      background: Highlight;
+    }
+    .ldg-row > .out::before {
+      background: CanvasText;
+    }
+    .ldg-row > .in.o::before {
+      background: Canvas;
+      box-shadow: inset 0 0 0 1.5px Highlight;
+    }
+    .ldg-row > .out.o::before {
+      background: Canvas;
+      box-shadow: inset 0 0 0 1.5px CanvasText;
+    }
+  }
+}
+
+/* Tile strip (components/tape/TileStrip.tsx): /gas, /validators, /dex and a token's holders, on the
+   block tape's primitives (.tp-gap tiles). Two kinds of tile are not a plain measurement:
+   .h (hatched) has NO size, so its width is a fixed 8px floor (--w is 0, flex-grow 0), never a share;
+   .r (rest, the "others" of a holders strip) is the remainder of the whole, neutral and not a link.
+   Neither draws the accent fill. A tile paired with a table row is ringed by [data-hot] (the shared
+   ring rule in "Tape primitives"), and the row it pairs with is shaded like a hovered one. */
+@layer components {
+  .tp-gap > li.h {
+    min-width: 8px;
+  }
+  .tp-gap > li.h :is(a, i) {
+    background: repeating-linear-gradient(135deg, var(--mut) 0 1.5px, transparent 1.5px 4px);
+  }
+  .tp-gap > li.r i {
+    background: var(--hair3);
+  }
+  .tp-gap > li:is(.h, .r) :is(a, i)::before {
+    display: none;
+  }
+  .dt tbody tr[data-hot] {
+    background: var(--bg);
+  }
+  /* Forced colours drop the backgrounds: the hatch is the data (unsized), so it is redrawn in system
+     colours, and the remainder keeps the CanvasText edge from the primitives' ::after. */
+  @media (forced-colors: active) {
+    .tp-gap > li.h :is(a, i) {
+      forced-color-adjust: none;
+      background: repeating-linear-gradient(135deg, CanvasText 0 1.5px, Canvas 1.5px 4px);
+    }
+  }
+}
+
+/* Loading skeleton (components/ui/DetailSkeleton.tsx). A handful of elements whose bars and row
+   lines are drawn with gradients, so the markup (shipped twice per page: Suspense fallback + RSC
+   payload) stays tiny. Heights match a detail page's first screen: header, 4-cell .ledger, 18 .dt
+   rows (38px from 640px, 56px below) ~1000px in all, so the footer starts below the fold. */
+@layer components {
+  .skel-head,
+  .skel-f > i,
+  .skel-table {
+    --sk: linear-gradient(var(--hair2), var(--hair2));
+  }
+  /* kicker (18px line), h1 (clamp like the real h1's line box), id line */
+  .skel-head {
+    --h1: clamp(27px, 3.57vw, 42px);
+    height: calc(54px + var(--h1));
+    margin-bottom: 20px;
+    background-image: var(--sk), var(--sk), var(--sk);
+    background-repeat: no-repeat;
+    background-size: 96px 12px, 256px var(--h1), min(384px, 100%) 20px;
+    background-position: 0 3px, 0 26px, 0 calc(34px + var(--h1));
+  }
+  /* The real .ledger supplies the card, 1px dividers and 2/4 columns; each cell draws its three bars. */
+  .skel-f {
+    margin-bottom: 24px;
+  }
+  .skel-f > i {
+    display: block;
+    height: 92px;
+    background-image: var(--sk), var(--sk), var(--sk);
+    background-repeat: no-repeat;
+    background-origin: content-box;
+    background-size: 64px 12px, 112px 20px, 80px 12px;
+    background-position: 0 0, 0 24px, 0 52px;
+  }
+  /* Card with a 34px header strip (::before), then 18 rows tiled with repeat-y: three bars and a
+     1px bottom line per row. 719/1043px = 34 + 18 rows, minus the last row's line, plus the border. */
+  .skel-table {
+    --rb: linear-gradient(transparent 22px, var(--hair2) 22px 34px, transparent 34px);
+    height: 1043px;
+    overflow: hidden;
+    border: 1px solid var(--hair);
+    border-radius: 12px;
+    background-color: var(--card);
+    background-image:
+      var(--rb), var(--rb), var(--rb),
+      linear-gradient(transparent 55px, var(--hair) 55px);
+    background-repeat: repeat-y;
+    background-size: 80px 56px, 48px 56px, 96px 56px, 100% 56px;
+    background-position: 12px 34px, 108px 34px, 172px 34px, 0 34px;
+  }
+  .skel-table::before {
+    content: "";
+    display: block;
+    height: 34px;
+    border-bottom: 1px solid var(--hair);
+    background: var(--sk) 12px 11px / 192px 12px no-repeat, var(--bg);
+  }
+  @media (min-width: 640px) {
+    .skel-table {
+      --rb: linear-gradient(transparent 13px, var(--hair2) 13px 25px, transparent 25px);
+      height: 719px;
+      background-image:
+        var(--rb), var(--rb), var(--rb),
+        linear-gradient(transparent 37px, var(--hair) 37px);
+      background-size: 160px 38px, 112px 38px, 224px 38px, 100% 38px;
+      background-position: 16px 34px, 192px 34px, 320px 34px, 0 34px;
+    }
+    .skel-table::before {
+      background-position: 16px 11px, 0 0;
+    }
+  }
+}
+
+/* Sponsored boxes (components/ads). AdSlot mounts its card only after it has fetched its config in
+   the browser, so each in-flow variant has ONE height per breakpoint at the default text size and
+   AdReserve (.rsv-*) holds exactly that much space on the server. Copy is clamped to fit: a card
+   shows at most 2 lines of title and 3 of body (stacked, CTA below, under 640px) or 1 and 2 (one
+   row, from 640px), so at the default size the content never exceeds the box and the box is
+   exactly --slot-*-h. The boxes (.slot-*) take it as a min-height, not a height: with scaled-up
+   text the box grows (one small shift) instead of clipping the CTA. Heights, border box: under
+   640px, card = 2 + 40 pad + (15 eyebrow + 2 + 48 title + 4 + 60 body) + 16 gap + 36 CTA; compact
+   has 32 pad. From 640px, card = 2 + 40 + (15 + 2 + 24 + 4 + 40); footer = 1 + 24 pad + 40
+   (under 640px: + 12 gap + 36 CTA). Change the copy clamps in AdSlot/HouseAd and these together. */
+:root {
+  --slot-card-h: 223px;
+  --slot-compact-h: 215px;
+  --slot-footer-h: 113px;
+}
+@media (min-width: 640px) {
+  :root {
+    --slot-card-h: 127px;
+    --slot-compact-h: 119px;
+    --slot-footer-h: 65px;
+  }
+}
+@layer components {
+  .slot-card {
+    min-height: var(--slot-card-h);
+  }
+  .slot-compact {
+    min-height: var(--slot-compact-h);
+  }
+  .slot-footer {
+    min-height: var(--slot-footer-h);
+  }
+  .rsv-card {
+    min-height: var(--slot-card-h);
+  }
+  .rsv-compact {
+    min-height: var(--slot-compact-h);
+  }
+  .rsv-footer {
+    min-height: var(--slot-footer-h);
+  }
+  /* AdSlot leaves <span hidden data-ad-empty> when nothing was chosen (restricted country,
+     placement disabled since the page rendered): drop the reserve, and its margin with it,
+     so the page is exactly as it was before ads were reserved. */
+  :is(.rsv-card, .rsv-compact, .rsv-footer):has(> [data-ad-empty]) {
+    min-height: 0;
+    margin: 0;
+  }
+}

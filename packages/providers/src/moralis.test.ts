@@ -1,0 +1,218 @@
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import { createMoralisAdapter } from './moralis'
+import { TOKEN_HOLDERS_PAGE_SIZE } from './types'
+
+const CFG = { kind: 'moralis' as const, moralisChain: '0x38' }
+
+afterEach(() => {
+  vi.unstubAllEnvs()
+  vi.unstubAllGlobals()
+})
+
+describe('createMoralisAdapter — failure envelope', () => {
+  it('reports not_configured when MORALIS_API_KEY is absent', async () => {
+    vi.stubEnv('MORALIS_API_KEY', '')
+    const r = await createMoralisAdapter(CFG).getAddressHistory('0xa4a-nokey')
+    expect(r).toEqual({ ok: false, reason: 'not_configured' })
+  })
+
+  it('reports disabled when the kill switch is on', async () => {
+    vi.stubEnv('MORALIS_DISABLED', 'true')
+    vi.stubEnv('MORALIS_API_KEY', 'k')
+    const r = await createMoralisAdapter(CFG).getAddressTokenBalances('0xa4a-disabled')
+    expect(r).toEqual({ ok: false, reason: 'disabled' })
+  })
+
+  it('reports upstream_error on non-OK HTTP and caches the negative (single fetch)', async () => {
+    vi.stubEnv('MORALIS_API_KEY', 'k')
+    const fetchMock = vi.fn().mockResolvedValue(new Response('boom', { status: 500 }))
+    vi.stubGlobal('fetch', fetchMock)
+    const a = createMoralisAdapter(CFG)
+    const r1 = await a.getAddressHistory('0xa4a-upstream')
+    expect(r1).toEqual({ ok: false, reason: 'upstream_error' })
+    const r2 = await a.getAddressHistory('0xa4a-upstream')
+    expect(r2.ok).toBe(false)
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+  })
+
+  it('reports upstream_error when fetch throws (timeout path)', async () => {
+    vi.stubEnv('MORALIS_API_KEY', 'k')
+    vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new Error('network')))
+    const r = await createMoralisAdapter(CFG).getAddressNfts('0xa4a-throw')
+    expect(r).toEqual({ ok: false, reason: 'upstream_error' })
+  })
+
+  it('LOGS the status and endpoint on a non-OK response', async () => {
+    // This path used to be `{ cacheSetNull; return fail(...) }` with no logging
+    // at all, and the backfill worker records only the reason string
+    // 'upstream_error'. So ~2,500 vendor 5xx over 30 days left NOTHING on our
+    // side to grep — diagnosing them needed a DB probe and the vendor console.
+    vi.stubEnv('MORALIS_API_KEY', 'k')
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('rate limited', { status: 429 })))
+    const spy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    await createMoralisAdapter(CFG).getAddressHistory('0xa4a-logs')
+    const line = spy.mock.calls.map((c) => String(c[0])).join('\n')
+    expect(line).toContain('[moralis]')
+    expect(line).toContain('wallets/:address/history')
+    expect(line).toContain('429')
+    spy.mockRestore()
+  })
+})
+
+
+describe('createMoralisAdapter — success mapping', () => {
+  it('maps a history page to camelCase ProviderTx rows and passes the chain id', async () => {
+    vi.stubEnv('MORALIS_API_KEY', 'k')
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      result: [{
+        hash: '0xh1', block_number: '123', block_timestamp: '2026-07-16T05:25:06Z',
+        from_address: '0xf', to_address: '0xt', value: '1000000000000000000',
+        gas_price: '5', receipt_gas_used: '21000', category: 'send',
+        summary: 'Sent 1 BNB', possible_spam: false,
+      }],
+      cursor: 'next-page',
+    }), { status: 200, headers: { 'content-type': 'application/json' } }))
+    vi.stubGlobal('fetch', fetchMock)
+    const r = await createMoralisAdapter(CFG).getAddressHistory('0xa4a-map')
+    expect(r.ok).toBe(true)
+    if (r.ok) {
+      expect(r.data.txs[0]).toMatchObject({
+        hash: '0xh1', blockNumber: '123', fromAddress: '0xf', toAddress: '0xt',
+        gasUsed: '21000', possibleSpam: false, erc20Transfers: [],
+      })
+      expect(r.data.cursor).toBe('next-page')
+      expect(r.data.totalTxs).toBe(0) // history endpoint returns no grand total
+    }
+    expect(String(fetchMock.mock.calls[0][0])).toContain('chain=0x38')
+  })
+
+  it('maps owners to TokenHoldersPage and reports upstream_error for a zero-holder result (cache parity with the old null)', async () => {
+    vi.stubEnv('MORALIS_API_KEY', 'k')
+    const ok = { total_supply: '5000', result: [{ owner_address: '0xAB', balance: '10', is_contract: true, percentage_relative_to_total_supply: 1.5 }] }
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify(ok), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ result: [] }), { status: 200 }))
+    vi.stubGlobal('fetch', fetchMock)
+    const a = createMoralisAdapter(CFG)
+    const r1 = await a.getTokenHolders('0xa4a-token1')
+    // The explorer's local estimate returns this many rows too (no layout shift on the swap).
+    expect(new URL(String(fetchMock.mock.calls[0][0])).searchParams.get('limit')).toBe(String(TOKEN_HOLDERS_PAGE_SIZE))
+    expect(r1.ok).toBe(true)
+    if (r1.ok) {
+      expect(r1.data.totalSupply).toBe('5000')
+      expect(r1.data.holders[0]).toMatchObject({ address: '0xab', balance: '10', isContract: true, percentage: '1.5' })
+    }
+    const r2 = await a.getTokenHolders('0xa4a-token2')
+    expect(r2).toEqual({ ok: false, reason: 'upstream_error' })
+  })
+})
+
+describe('createMoralisAdapter — A4b-0 host context', () => {
+  it('uses the host-supplied native currency in the native-transfer summary', async () => {
+    vi.stubEnv('MORALIS_API_KEY', 'k')
+    // No erc20 legs and a blank Moralis prose → falls through to the native-value branch,
+    // which is the only place `currency` is used.
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      result: [{
+        hash: '0xh2', block_number: '9', block_timestamp: '2026-07-16T05:25:06Z',
+        from_address: '0xf', to_address: '0xt', value: '2000000000000000000',
+        gas_price: '5', receipt_gas_used: '21000', category: 'send',
+        summary: '', possible_spam: false,
+      }],
+      cursor: null,
+    }), { status: 200 }))
+    vi.stubGlobal('fetch', fetchMock)
+    const r = await createMoralisAdapter(CFG, { currency: 'BNB' }).getAddressHistory('0xa4a-cur')
+    expect(r.ok).toBe(true)
+    if (r.ok) expect(r.data.txs[0].summary).toBe('2 BNB transfer')
+  })
+
+  it('omits the ticker when no currency is supplied (indexer default)', async () => {
+    vi.stubEnv('MORALIS_API_KEY', 'k')
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      result: [{
+        hash: '0xh3', block_number: '9', block_timestamp: '2026-07-16T05:25:06Z',
+        from_address: '0xf', to_address: '0xt', value: '2000000000000000000',
+        gas_price: '5', receipt_gas_used: '21000', category: 'send',
+        summary: '', possible_spam: false,
+      }],
+      cursor: null,
+    }), { status: 200 }))
+    vi.stubGlobal('fetch', fetchMock)
+    const r = await createMoralisAdapter(CFG).getAddressHistory('0xa4a-nocur')
+    expect(r.ok).toBe(true)
+    if (r.ok) expect(r.data.txs[0].summary).toBe('2 transfer')
+  })
+
+  it('carries the provider log index onto transfers (A4b R3 stable identity)', async () => {
+    vi.stubEnv('MORALIS_API_KEY', 'k')
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      result: [
+        { transaction_hash: '0xt1', log_index: 7, block_number: '5', block_timestamp: '2026-07-16T05:25:06Z',
+          from_address: '0xf', to_address: '0xt', address: '0xc', token_name: 'T', token_symbol: 'T',
+          token_decimals: '18', value: '1', value_decimal: '1' },
+        { transaction_hash: '0xt2', block_number: '5', block_timestamp: '2026-07-16T05:25:06Z',
+          from_address: '0xf', to_address: '0xt', address: '0xc', token_name: 'T', token_symbol: 'T',
+          token_decimals: '18', value: '1', value_decimal: '1' },
+      ],
+      cursor: null,
+    }), { status: 200 }))
+    vi.stubGlobal('fetch', fetchMock)
+    const r = await createMoralisAdapter(CFG).getAddressTokenTransfers('0xa4a-logidx')
+    expect(r.ok).toBe(true)
+    if (r.ok) {
+      expect(r.data.transfers[0].logIndex).toBe('7')
+      // upstream omitted it → null (NOT '') so it cannot type-check as a usable
+      // PK component; the A4b worker skips these rather than colliding.
+      expect(r.data.transfers[1].logIndex).toBeNull()
+    }
+  })
+})
+
+describe('createMoralisAdapter — getAddressNfts', () => {
+  const nft = (over: Record<string, unknown>) => ({
+    token_address: '0xc011', token_id: '1', name: 'Apes', symbol: 'APE', metadata: null, ...over,
+  })
+  const stubNfts = (result: unknown[]) => {
+    vi.stubEnv('MORALIS_API_KEY', 'k')
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ result }), { status: 200 }))
+    vi.stubGlobal('fetch', fetchMock)
+    return fetchMock
+  }
+
+  it('asks Moralis to exclude spam, like the erc20 endpoint', async () => {
+    const fetchMock = stubNfts([])
+    await createMoralisAdapter(CFG).getAddressNfts('0xa4a-nft-spam')
+    expect(new URL(String(fetchMock.mock.calls[0][0])).searchParams.get('exclude_spam')).toBe('true')
+  })
+
+  it('drops an item Moralis attributes to a different owner, matching the wallet case-insensitively', async () => {
+    const me = '0xA4A00000000000000000000000000000000000AA'
+    stubNfts([
+      nft({ token_id: '1', owner_of: me.toLowerCase() }),
+      nft({ token_id: '2', owner_of: '0x' + '9'.repeat(40) }),
+      nft({ token_id: '3' }),   // no owner_of: nothing contradicts the request
+    ])
+    const r = await createMoralisAdapter(CFG).getAddressNfts(me)
+    expect(r.ok).toBe(true)
+    if (r.ok) expect(r.data.map((n) => n.tokenId)).toEqual(['1', '3'])
+  })
+
+  it('accepts only https image URLs, falling back to the media URL when it is https', async () => {
+    stubNfts([
+      nft({ token_id: '1', metadata: JSON.stringify({ image: 'https://cdn.example/1.png' }) }),
+      nft({ token_id: '2', metadata: JSON.stringify({ image: 'http://cdn.example/2.png' }) }),
+      nft({ token_id: '3', metadata: JSON.stringify({ image: 'ipfs://bafy/3.png' }), media: { original_media_url: 'https://cdn.example/3.png' } }),
+      nft({ token_id: '4', metadata: JSON.stringify({ image: 'javascript:alert(1)' }) }),
+      nft({ token_id: '5', metadata: JSON.stringify({ image: 'data:image/svg+xml;base64,PHN2Zz4=' }) }),
+      nft({ token_id: '6', metadata: JSON.stringify({ image: { not: 'a string' } }), media: { original_media_url: 'http://cdn.example/6.png' } }),
+    ])
+    const r = await createMoralisAdapter(CFG).getAddressNfts('0xa4a-nft-image')
+    expect(r.ok).toBe(true)
+    if (r.ok) {
+      expect(r.data.map((n) => n.imageUrl)).toEqual([
+        'https://cdn.example/1.png', null, 'https://cdn.example/3.png', null, null, null,
+      ])
+    }
+  })
+})

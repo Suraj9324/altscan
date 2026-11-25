@@ -1,0 +1,1216 @@
+/**
+ * Moralis implementation of ProviderAdapter — the ONLY file that talks to
+ * deep-index.moralis.io (guardrail-tested). All original protections are
+ * unchanged from apps/explorer/lib/providers/moralis.ts: Redis/kv response
+ * cache (off-heap, shared across instances), per-bucket fleet-wide rate
+ * limiter (moralis:rl:v7 keys), MORALIS_DISABLED kill switch. Bot policy
+ * stays in the explorer shim.
+ *
+ * A4b-0: lifted into @altscan/providers so the indexer can import it. Three
+ * deltas vs the explorer copy, all mechanical:
+ *   - `currency` (native ticker, summaries only) is passed in by the host
+ *     instead of read from the explorer's chain singleton.
+ *   - `sanitizeSymbol` comes from @altscan/explorer-core.
+ *   - the cache-registry side effect moved to the explorer shim: this module
+ *     must stay side-effect-free because the indexer has no cache registry.
+ *     The explorer still registers `getKvFallbackSize` for its memory monitor.
+ *
+ * CU BUDGET — the account is on a plan with a MONTHLY Compute Unit allowance.
+ * (This header said "Free tier: 40,000 CU/day" until 2026-08-01. That was stale
+ * and it mattered: every control below was sized against a DAILY figure that no
+ * longer described the bill.)
+ * Strategy:
+ *   - A hard MONTHLY CU ceiling (see monthlyCuMax) — the only control that can
+ *     actually bound a monthly bill. Added 2026-08-01 after A4b backfill stayed
+ *     inside its per-hour cap for 5 days and still ran the account to 100%.
+ *   - Strict per-bucket rate limits (history/holders/assets, env-overridable)
+ *   - Long cache TTLs (2hr per address) to avoid re-fetches
+ *   - Small page sizes (limit=10-25). NOTE: billing is per REQUEST, so this does
+ *     NOT minimize CU — it splits the same rows across more billed calls. Kept
+ *     for latency/payload reasons only; see the CU_COST block.
+ *   - exclude_spam=true on token endpoints to skip noise
+ *   - Only fetch for the active tab, never prefetch other tabs
+ *   - Bot detection (explorer shim) skips the provider entirely for crawlers
+ */
+import { kvGet, kvSet, getRedis, isRedisUnavailable, sanitizeSymbol } from '@altscan/explorer-core'
+import { currentClientAdmission } from './client-admission'
+import type { DataProviderConfig } from '@altscan/chain-config'
+import type {
+  AddressHistoryPage,
+  ProviderAdapter,
+  ProviderFailReason,
+  ProviderNft,
+  ProviderResult,
+  ProviderTokenBalance,
+  TokenHoldersPage,
+  TokenTransfersPage,
+} from './types'
+import { TOKEN_HOLDERS_PAGE_SIZE } from './types'
+
+const BASE = 'https://deep-index.moralis.io/api/v2.2'
+
+// Cache strategy: responses live in Redis (shared across instances, OFF the Node heap),
+// with a small bounded in-memory fallback when Redis is absent (see @altscan/explorer-core
+// kv-cache). Moving this cache off the heap is what lets Moralis stay enabled without the
+// OOM crash-loop that the old in-process Map caused on BNBScan.
+// NULL_SENTINEL: negative results are cached for NULL_TTL to stop repeated Moralis calls
+// for addresses that don't exist (a common abuse pattern).
+const NULL_SENTINEL = '__null__'
+const NULL_TTL = 5 * 60_000          // 5 minutes for negative results
+const CACHE_TTL = 2 * 60 * 60_000    // 2 hours for positive results. Idle wallets (the only ones
+                                     // that hit Moralis — active ones are in the local index) are
+                                     // static, so longer caching is safe and cuts repeat calls ~4x.
+                                     // Capped at 2h (not 24h) because bnbscan-redis is a starter
+                                     // instance with noeviction — an over-full cache would fail the
+                                     // rate-limiter INCR too.
+
+/**
+ * Read a cached JSON value.
+ * Returns: undefined = cache miss, null = cached negative result, T = cached hit.
+ */
+async function cacheGetJson<T>(key: string): Promise<T | null | undefined> {
+  const raw = await kvGet(key)
+  if (raw === null) return undefined          // miss
+  if (raw === NULL_SENTINEL) return null      // cached negative result
+  try {
+    return JSON.parse(raw) as T
+  } catch {
+    return undefined
+  }
+}
+
+async function cacheSetJson(key: string, data: unknown): Promise<void> {
+  await kvSet(key, JSON.stringify(data), CACHE_TTL)
+}
+
+async function cacheSetNull(key: string): Promise<void> {
+  await kvSet(key, NULL_SENTINEL, NULL_TTL)
+}
+
+/**
+ * Log WHY an upstream call failed.
+ *
+ * Every `!res.ok` path below used to be `{ cacheSetNull; return fail(...) }` with
+ * NO log line at all, and the backfill worker records only `res.reason` — the
+ * literal string 'upstream_error'. So on 2026-09-09 Moralis reported ~2,500 HTTP
+ * 5xx over 30 days while our side retained nothing about any of them: not a
+ * status, not a body, not a count. Diagnosing it needed a database probe and the
+ * vendor dashboard, neither of which is available mid-incident.
+ *
+ * The status alone is what was missing and what distinguishes a 500 from a 429
+ * from a bad address. The body is deliberately NOT read: `await res.text()`
+ * buffers the whole response before any truncation could apply, so a large
+ * provider error page would be fully allocated on a path that fires thousands
+ * of times a month.
+ */
+function logUpstreamFailure(endpoint: string, status: number): void {
+  console.error(`[moralis] ${endpoint} failed — HTTP ${status}`)
+}
+
+/**
+ * An NFT's image is token-controlled metadata that the explorer puts in an <img src>. Only an
+ * https URL is accepted: not http (mixed content), ipfs:// (not loadable), data: or javascript:.
+ */
+function httpsUrl(value: unknown): string | null {
+  if (typeof value !== 'string') return null
+  try {
+    return new URL(value).protocol === 'https:' ? value : null
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Build a clean, human-readable summary for a Moralis history item.
+ * Moralis's own `summary` field is garbled for swaps — e.g. it returns
+ * "Swapped 0.134 WBNB and 0.134 BNB for 0.134 WBNB and 0.134 BNB" (same tokens
+ * and amounts on both sides). We rebuild swaps from the structured
+ * erc20_transfers and only fall back to Moralis's prose for simple cases.
+ *
+ * `currency` is the host chain's native ticker, supplied by the caller (the
+ * package has no chain singleton). Empty string simply omits the ticker.
+ */
+function summarizeMoralisHistory(t: {
+  category: string
+  summary: string
+  value: string
+  erc20_transfers?: Array<{
+    token_symbol: string
+    contract_address: string
+    value_formatted: string
+    direction: string
+  }>
+}, currency: string): string {
+  const transfers = t.erc20_transfers ?? []
+  const fmtAmt = (v: string): string => {
+    const n = Number(v)
+    if (!isFinite(n) || n === 0) return '0'
+    if (n < 0.0001) return n.toExponential(2)
+    return n.toLocaleString('en-US', { maximumFractionDigits: 4 })
+  }
+  const symOf = (s: string): string => sanitizeSymbol(s || '').slice(0, 12) || 'tokens'
+  const largest = <T extends { value_formatted: string }>(arr: T[]): T | undefined =>
+    arr.slice().sort((a, b) => Number(b.value_formatted) - Number(a.value_formatted))[0]
+  const humanizeCategory = (c: string): string =>
+    c ? c.replace(/[_-]+/g, ' ').replace(/\b\w/g, (ch) => ch.toUpperCase()) : 'Transaction'
+  const isDegenerate = (s: string): boolean => {
+    const i = s.toLowerCase().indexOf(' for ')
+    if (i === -1) return false
+    const before = s.slice(0, i).replace(/^\s*swapped\s+/i, '').trim()
+    const after = s.slice(i + 5).trim()
+    return before === after
+  }
+
+  const sent = transfers.filter((e) => e.direction === 'send')
+  const received = transfers.filter((e) => e.direction === 'receive')
+
+  // Swap: tokens both leaving and entering the wallet — the exact case Moralis garbles.
+  if (sent.length > 0 && received.length > 0) {
+    const out = largest(sent)
+    const inc = largest(received)
+    if (out && inc && out.contract_address?.toLowerCase() !== inc.contract_address?.toLowerCase()) {
+      return `Swapped ${fmtAmt(out.value_formatted)} ${symOf(out.token_symbol)} for ${fmtAmt(inc.value_formatted)} ${symOf(inc.token_symbol)}`
+    }
+    return 'Token swap'
+  }
+
+  // Non-swap: trust Moralis prose unless it's empty, the uninformative
+  // "Signed a transaction", or the degenerate "X for X" form.
+  const prose = t.summary?.trim()
+  if (prose && prose !== 'Signed a transaction' && !isDegenerate(prose)) {
+    return prose
+  }
+
+  // Structured single-sided transfer.
+  if (sent.length > 0) {
+    const out = largest(sent)
+    if (out) return `Sent ${fmtAmt(out.value_formatted)} ${symOf(out.token_symbol)}`
+  }
+  if (received.length > 0) {
+    const inc = largest(received)
+    if (inc) return `Received ${fmtAmt(inc.value_formatted)} ${symOf(inc.token_symbol)}`
+  }
+
+  // Native-value transfer with no token legs, else humanized category.
+  const nativeVal = Number(t.value) / 1e18
+  if (nativeVal > 0) {
+    const amount = nativeVal.toLocaleString('en-US', { maximumFractionDigits: 6 })
+    return currency ? `${amount} ${currency} transfer` : `${amount} transfer`
+  }
+  return humanizeCategory(t.category)
+}
+
+/**
+ * Normalize an upstream `log_index` into a stable primary-key component.
+ *
+ * A4b (R3) keys backfilled token transfers on (scope_address, tx_hash,
+ * log_index). Returning a sentinel string here would be unsafe: `''` satisfies
+ * the `string` type, so two absent values within one tx would type-check and
+ * then collide on the PK. `null` makes absence unrepresentable as a key and
+ * forces every consumer to decide.
+ *
+ * Accepts only a non-negative integer (as number or decimal string) and
+ * canonicalizes it, so `7`, `'7'` and `'007'` all map to `'7'`. Rejects
+ * absent, empty, whitespace, negative, fractional, and non-numeric input.
+ */
+export function normalizeLogIndex(raw: string | number | null | undefined): string | null {
+  if (raw == null) return null
+  if (typeof raw === 'number') {
+    return Number.isInteger(raw) && raw >= 0 ? String(raw) : null
+  }
+  const trimmed = raw.trim()
+  if (!/^\d+$/.test(trimmed)) return null
+  const n = Number(trimmed)
+  return Number.isSafeInteger(n) ? String(n) : null
+}
+
+/**
+ * Rate limiter — PER-FEATURE budgets so a spike/abuse in one feature can't starve the others.
+ * Buckets:
+ *   - history : getAddressHistory                                        (~148 CU/call)
+ *   - holders : getTokenHolders + getTokenHolderCount                    (~51 CU/call, 2 calls/token)
+ *   - assets  : getAddressTokenBalances (100) + getAddressNfts (50) + getAddressTokenTransfers (50)
+ * Caps are env-overridable; defaults sum to 1500/hr + 10000/day — the prior single-bucket total —
+ * so total Moralis exposure is UNCHANGED (this only partitions it). A saturated bucket fails with
+ * reason 'rate_limited' → the caller falls back to its local view, and the OTHER buckets keep serving.
+ * Keyed in Redis so caps apply fleet-wide (in-memory fallback when Redis is down).
+ */
+type MoralisBucket = 'history' | 'holders' | 'assets'
+
+const HOURLY_WINDOW = 3600_000
+const DAILY_WINDOW = 86400_000
+
+function envInt(name: string, fallback: number): number {
+  return parseInt(process.env[name] ?? String(fallback), 10) || fallback
+}
+
+/**
+ * Strict positive-integer env read for values that BOUND SPEND.
+ *
+ * `envInt` above uses `parseInt`, which is wrong for anything a budget depends
+ * on, in two directions that both bite:
+ *   - `parseInt` takes a NUMERIC PREFIX, so "999999999999999999999garbage"
+ *     yields ~1e30 — a ceiling that can never be reached, i.e. no ceiling.
+ *   - `"1_000"` yields 1, because parsing stops at the underscore. A config
+ *     typo meant as "raise the limit" becomes an outage instead.
+ * `|| fallback` also silently accepts negatives, and a negative CU cost makes
+ * every call DECREMENT the meter, so usage runs backwards forever.
+ *
+ * Requiring the whole string to be digits rejects all of it: "1_000", "1e9",
+ * "0x10", "+5", "-1", "Infinity", "12garbage", "" and "  ". The upper bound
+ * closes the last gap — an absurd but well-formed number is still no ceiling.
+ *
+ * `envInt` is deliberately left alone for the hourly/daily CALL caps: those
+ * predate this incident, are not the billing unit, and changing their parsing
+ * is not this PR's job.
+ */
+export function strictPositiveInt(
+  raw: string | undefined,
+  fallback: number,
+  max: number,
+): number {
+  if (raw == null) return fallback
+  const t = raw.trim()
+  if (!/^[0-9]+$/.test(t)) return fallback
+  const n = Number(t)
+  if (!Number.isSafeInteger(n) || n <= 0 || n > max) return fallback
+  return n
+}
+
+/** No single endpoint plausibly costs more than this; a larger configured value
+ *  is a typo, and honouring it would let one call exhaust the month. */
+const MAX_CU_COST = 100_000
+const cuCostEnv = (name: string, fallback: number): number =>
+  strictPositiveInt(process.env[name], fallback, MAX_CU_COST)
+
+type BucketCaps = { hourlyMax: number; dailyMax: number }
+const BUCKET_CAPS: Record<MoralisBucket, BucketCaps> = {
+  history: { hourlyMax: envInt('MORALIS_HISTORY_HOURLY_MAX', 700), dailyMax: envInt('MORALIS_HISTORY_DAILY_MAX', 5000) },
+  holders: { hourlyMax: envInt('MORALIS_HOLDERS_HOURLY_MAX', 400), dailyMax: envInt('MORALIS_HOLDERS_DAILY_MAX', 2500) },
+  assets:  { hourlyMax: envInt('MORALIS_ASSETS_HOURLY_MAX', 400),  dailyMax: envInt('MORALIS_ASSETS_DAILY_MAX', 2500) },
+}
+
+// v7 keys: per-bucket. Bumped from v6 (single shared counter) so the new buckets start clean and
+// the poisoned/over-inflated v6 counter is abandoned (same trick as every prior limiter fix).
+const RL_PREFIX = 'moralis:rl:v7'
+function bucketKeys(bucket: MoralisBucket): { hourly: string; daily: string } {
+  return { hourly: `${RL_PREFIX}:${bucket}:hourly`, daily: `${RL_PREFIX}:${bucket}:daily` }
+}
+
+/**
+ * MEASURED CU COSTS — settled 2026-09-09 from admin.moralis.com/usage.
+ *
+ * These began as prose comments ("Cost: ~25 CU") that had never been checked
+ * against Moralis's rate table. They became DATA debited from a real budget,
+ * and the guessed numbers were wrong by up to 6x, which is why a "1,000,000 CU"
+ * ceiling was really a ~6,000,000 one and the account reached 75% of plan with
+ * overages billing while the meter read 16%.
+ *
+ * Derived as 30d CU / 30d requests, per endpoint, over a 4,000,000 CU window:
+ *
+ *   endpoint                     CU/call   was
+ *   /wallets/:address/history      ~148     25   <- 85% of the entire bill
+ *   /:address/erc20/transfers       ~50     25
+ *   /:address/erc20                 100     25
+ *   /:address/nft                    50     25
+ *   /erc20/:token/owners            ~51     50   (already correct)
+ *   /erc20/:token/holders           ~51     50   (already correct)
+ *
+ * Billing is PER REQUEST, not per result: the ratios come out clean at fixed
+ * page sizes. That settles the open question this comment used to pose, and it
+ * inverts one of the header's strategy bullets — small `limit` values do NOT
+ * reduce spend. For a fixed volume of data a smaller page splits the same rows
+ * across MORE billed requests, so `limit=10` on erc20/transfers costs 2.5x what
+ * `limit=25` would. Raising those limits is a real saving and a separate change.
+ *
+ * The counters these feed are NOT retroactively repriced: usage accrued before
+ * this correction sits in Redis at the old rate for the rest of that month.
+ *
+ * Every entry stays env-overridable so a rate change can be applied WITHOUT a
+ * deploy, the same no-deploy property that let the backfill flag flip.
+ */
+export const CU_COST = {
+  addressHistory:   cuCostEnv('MORALIS_CU_ADDRESS_HISTORY', 150),
+  addressBalances:  cuCostEnv('MORALIS_CU_ADDRESS_BALANCES', 100),
+  addressTransfers: cuCostEnv('MORALIS_CU_ADDRESS_TRANSFERS', 50),
+  addressNfts:      cuCostEnv('MORALIS_CU_ADDRESS_NFTS', 50),
+  tokenHolders:     cuCostEnv('MORALIS_CU_TOKEN_HOLDERS', 50),
+  tokenHolderCount: cuCostEnv('MORALIS_CU_TOKEN_HOLDER_COUNT', 50),
+} as const
+
+/**
+ * Monthly CU ceiling — PER LEDGER, not per Moralis account. Read the scope
+ * note below before sizing it; an earlier revision of this comment called it
+ * "account-wide", which it is not and cannot be with the current infrastructure.
+ *
+ * ⚠ SCOPE. There is one ledger per Redis, plus one per process that has no
+ * Redis. BNB web + indexer share a Redis ⇒ one ledger. ETH has no Redis ⇒ each
+ * ETH process counts alone. So this value is enforced up to ~4 times over
+ * against ONE Moralis account. Provisioning Redis for ETH (Track C1) is the
+ * only thing that makes a single ceiling mean what its name suggests.
+ *
+ * This is the control that did not exist before 2026-08-01, and its absence is
+ * why the account hit 100% of plan.
+ *
+ * Hourly and daily CALL caps cannot bound a MONTHLY CU bill. Backfill never
+ * once exceeded its 300-pages/hour reserve; it simply ran at that reserve for
+ * five days. Every per-request control was green the entire time.
+ *
+ * Default is ~4x the measured pre-incident fleet baseline (~450k CU/month at
+ * the estimated rates), which leaves real traffic untouched while hard-stopping
+ * a runaway in days rather than never. Raise it once the true plan allowance is
+ * known — that is a one-line env change.
+ */
+const DEFAULT_MONTHLY_CU_MAX = 2_000_000
+const MONTHLY_TTL = 35 * 86400_000  // key is month-stamped; TTL only reaps old months
+
+/**
+ * FAIL-CLOSED config read. Unset, blank, whitespace, zero, negative, or
+ * unparseable all fall back to the default ceiling. There is deliberately NO
+ * value that DISABLES the ceiling.
+ *
+ * This is the direct lesson of the CREATIVES_KEY_PREFIX finding: a check that
+ * reads config and treats "unset" as "skip" ships the hole it was written to
+ * close. If you want more headroom, raise the number; you cannot switch the
+ * meter off.
+ */
+/** Upper bound on a configurable ceiling. A well-formed but absurd number is
+ *  still "no ceiling" in practice; at $11.25 per million CU this cap keeps the
+ *  worst configurable monthly overage around four figures rather than
+ *  unbounded. Anything larger is a typo, not an intent. */
+const MAX_MONTHLY_CU = 100_000_000
+
+export function monthlyCuMax(env: Record<string, string | undefined> = process.env): number {
+  return strictPositiveInt(env.MORALIS_MONTHLY_CU_MAX, DEFAULT_MONTHLY_CU_MAX, MAX_MONTHLY_CU)
+}
+
+/**
+ * Day of the month the vendor's CU allowance resets, UTC.
+ *
+ * The plan quota does NOT necessarily roll on the 1st. Verified 2026-09-09 from
+ * the Moralis console: "Renewal Period: 26 Aug 2026, 08:17 - 26 Sep 2026, 08:17"
+ * — a 26th-to-26th cycle. A ledger keyed to the calendar month is then ~5 days
+ * out of phase with the thing it is meant to bound, in BOTH directions:
+ *   - after the vendor resets but before the 1st, the local counter still holds
+ *     the old month and can refuse calls against a quota that is actually fresh;
+ *   - after the 1st, the counter is empty while the real cycle is already days
+ *     consumed, so the ceiling under-protects exactly when it matters.
+ *
+ * Capped at 28 so the day exists in every month, including February.
+ *
+ * ⚠ TWO THINGS THIS DELIBERATELY DOES NOT MODEL. Read before setting the var.
+ *
+ * 1. TIME OF DAY. The cycle rolls at a timestamp (08:17), this key rolls at
+ *    00:00 UTC. The timezone of that 08:17 is NOT established: the vendor's
+ *    usage page renders "your local timezone (UTC+08:00)", which would put the
+ *    real reset at 00:17 UTC — 17 minutes from the day boundary — but the
+ *    billing page carries no such note, and if it is UTC the gap is 8h17m. In
+ *    the gap the local ledger is fresh while the vendor quota is not, so calls
+ *    are admitted against an allowance that may already be spent. The exposure
+ *    is bounded by ceiling headroom (the per-ledger caps are sized to sum
+ *    UNDER plan), not by this function. Settle the timezone before relying on
+ *    the boundary being tight.
+ *
+ * 2. ACTIVATION IS NOT A MIGRATION. Setting this var re-points the key without
+ *    moving the tally. Mid-cycle that is worse than a one-time under-count:
+ *    the key it points AT is the previous calendar month's, which under
+ *    MONTHLY_TTL has usually already expired — so the ledger starts at ZERO and
+ *    hands out a full fresh allowance inside a cycle that is already partly
+ *    spent. SET THIS ONLY JUST AFTER A CYCLE BOUNDARY, where a zeroed ledger is
+ *    the correct state rather than a hole. There is no in-code guard for this;
+ *    the ledger belongs to Redis and this function cannot see it.
+ *
+ * DEFAULT 1 IS EXACTLY THE OLD BEHAVIOUR: with day=1 the guard below can never
+ * fire, so the key stays the plain calendar month until the var is set.
+ */
+const MAX_CYCLE_DAY = 28
+export function cycleStartDay(env: Record<string, string | undefined> = process.env): number {
+  return strictPositiveInt(env.MORALIS_CYCLE_DAY, 1, MAX_CYCLE_DAY)
+}
+
+/** Billing-cycle key, UTC — stamped with the month the CURRENT cycle STARTED.
+ *  Rollover needs no scheduled reset and a stale key cannot silently carry the
+ *  previous cycle's spend into this one.
+ *
+ *  Year/month are stepped by hand rather than via `setUTCMonth(m - 1)`. That
+ *  call normalises an out-of-range day (31 February becomes 3 March), which
+ *  would stamp the wrong cycle. Today it could not actually fire — we only step
+ *  back when `getUTCDate() < day <= 28`, so the day is at most 27 and exists in
+ *  every month, February included — but that safety is a non-obvious
+ *  consequence of MAX_CYCLE_DAY, not of the arithmetic. Raising the cap would
+ *  silently reintroduce the bug. Plain integer stepping cannot have it. */
+export function monthKey(now: Date = new Date(), day: number = cycleStartDay()): string {
+  let y = now.getUTCFullYear()
+  let m = now.getUTCMonth() // 0-11
+  if (now.getUTCDate() < day) {
+    m -= 1
+    if (m < 0) { m = 11; y -= 1 }
+  }
+  return `${y}-${String(m + 1).padStart(2, '0')}`
+}
+const cuKey = (now?: Date): string => `moralis:cu:v1:${monthKey(now)}`
+
+// In-memory fallback — per bucket, used only when Redis is unavailable (e.g. EthScan has no Redis,
+// or a Redis blip). Per-instance, so with numInstances > 1 the effective cap is N×; acceptable.
+type MemCounter = { hourly: number; hourlyStart: number; daily: number; dailyStart: number }
+const memCounters: Record<MoralisBucket, MemCounter> = {
+  history: { hourly: 0, hourlyStart: Date.now(), daily: 0, dailyStart: Date.now() },
+  holders: { hourly: 0, hourlyStart: Date.now(), daily: 0, dailyStart: Date.now() },
+  assets:  { hourly: 0, hourlyStart: Date.now(), daily: 0, dailyStart: Date.now() },
+}
+
+/** Per-process monthly CU tally, used when Redis is absent (EthScan). */
+let memCu: { month: string; used: number } = { month: monthKey(), used: 0 }
+
+/**
+ * True while the Redis ledger is refusing the CU debit.
+ *
+ * 2026-09-15: both Render key-value instances are 256MB `starter` plans with
+ * maxmemory-policy=noeviction, and the explorer's `body:tx:*` cache filled
+ * them (172,133 of 172,218 keys on ETH). `noeviction` does not evict — it
+ * REFUSES writes — so ADMIT_LUA aborted on its INCRBY with "OOM command not
+ * allowed when used memory > 'maxmemory'", the catch in isRateLimited swallowed
+ * it, and the fail-closed guard denied the call.
+ *
+ * Denying is right. Denying in SILENCE is what cost a month of overage: the
+ * ledger froze at 262,375 on 2026-09-08 18:00 UTC and /api/health went on
+ * reporting `used: 262375, max: 1500000, limited: false, source: 'redis'` — a
+ * comfortable 17% — for a week while every Moralis call on both chains was
+ * refused and the vendor billed ~2,000,000 CU. A ceiling whose counter cannot
+ * be written is not a ceiling, and nothing in the readout said so.
+ *
+ * Cleared only when the script actually COMMITS (returns 0). A denial code
+ * (1/2/3) returns before the INCRBY, so it proves nothing about writability
+ * and must not clear this.
+ */
+let ledgerUnwritable = false
+
+/** Log on the TRANSITION only — this path runs on every admission, and the
+ *  failure mode is a week long, so per-call logging would be a log flood. Same
+ *  one-shot idiom as redis-client's `[redis] unavailable` / `reconnected`. */
+function noteLedgerWriteFailed(err: unknown): void {
+  if (ledgerUnwritable) return
+  ledgerUnwritable = true
+  console.error(
+    '[moralis] CU ledger write REFUSED — the monthly ceiling can no longer record spend ' +
+      `or bind, and every call is being denied: ${err instanceof Error ? err.message : String(err)}`,
+  )
+}
+
+function noteLedgerWriteOk(): void {
+  if (!ledgerUnwritable) return
+  ledgerUnwritable = false
+  console.log('[moralis] CU ledger writable again — monthly accounting resumed')
+}
+
+/** Roll expired windows for one bucket. Split out so the health readout can
+ *  report in-memory counters without also mutating spend. */
+function rollMemWindows(bucket: MoralisBucket): MemCounter {
+  const now = Date.now()
+  const c = memCounters[bucket]
+  if (now - c.hourlyStart > HOURLY_WINDOW) { c.hourly = 0; c.hourlyStart = now }
+  if (now - c.dailyStart > DAILY_WINDOW) { c.daily = 0; c.dailyStart = now }
+  const mk = monthKey()
+  if (memCu.month !== mk) memCu = { month: mk, used: 0 }
+  return c
+}
+
+/** Check ALL ceilings BEFORE mutating any of them, so a denial can never leave
+ *  a partial debit behind (the Redis path has to refund for the same reason). */
+function isRateLimitedMemory(bucket: MoralisBucket, cuCost: number): boolean {
+  const c = rollMemWindows(bucket)
+  const { hourlyMax, dailyMax } = BUCKET_CAPS[bucket]
+  if (memCu.used + cuCost > monthlyCuMax()) return true
+  if (c.daily >= dailyMax) return true
+  if (c.hourly >= hourlyMax) return true
+  memCu.used += cuCost
+  c.hourly++; c.daily++
+  return false
+}
+
+/**
+ * Redis-backed per-bucket limiter. INCR then, if over cap, DECR back so blocked retries don't keep
+ * inflating the counter (the old code's INCR-before-check let a blocked feature climb to 3× its cap
+ * and made the health readout lie). Always guarantees a TTL: set on first INCR, re-arm if PTTL<0.
+ */
+/**
+ * Admission control as ONE atomic Redis operation.
+ *
+ * The previous shape was INCR-then-DECR-on-denial, and it could not be made
+ * correct by adding more refunds. Every early return and every thrown
+ * connection error left the ledger holding spend for a call that was never
+ * sent, and the JS `catch` then fell through to a SEPARATE in-memory ledger
+ * with no idea which Redis commands had committed. Result: leaked budget in one
+ * direction, under-counting in the other, and no way to tell which had happened.
+ *
+ * Inside EVAL the whole decision is one step: read all three counters, decide,
+ * and only then commit. There is no intermediate state, so there is nothing to
+ * refund and no interleaving with the other processes sharing this Redis.
+ *
+ * It also removes a race the sequential version could not avoid: an hourly key
+ * that expired between INCR and PTTL got recreated by the compensating DECR as
+ * `-1` with NO TTL, so the next window silently started 701 calls in credit.
+ * Nothing here ever decrements.
+ *
+ * Returns 0 admitted, 1 monthly-denied, 2 hourly-denied, 3 daily-denied.
+ */
+const ADMIT_LUA = `
+local cuCost    = tonumber(ARGV[1])
+local cuMax     = tonumber(ARGV[2])
+local hourlyMax = tonumber(ARGV[3])
+local dailyMax  = tonumber(ARGV[4])
+
+-- Read a counter, and DELETE it if it holds anything INCRBY would refuse.
+--
+-- The first version of this script did 'tonumber(GET) or 0', which quietly
+-- turned a malformed value into 0. The comparison then passed, and the very
+-- next INCRBY aborted the script with a type error — AFTER earlier INCRBYs in
+-- the same script had already committed. Redis does NOT roll back partial Lua
+-- writes, so "EVAL is all-or-nothing" (as this file previously claimed) is
+-- false once a call can error mid-script. One corrupt key therefore produced a
+-- committed CU debit with no TTL, and every subsequent EVAL threw.
+--
+-- tonumber() alone is not enough: it accepts " 25", "25.0" and "0x19", none of
+-- which INCRBY will take. Round-tripping through %d is the exact test.
+local function readCounter(key)
+  local raw = redis.call('GET', key)
+  if raw == false then return 0 end
+  local n = tonumber(raw)
+  if n == nil or n ~= math.floor(n) or string.format('%d', n) ~= raw then
+    redis.call('DEL', key)
+    return 0
+  end
+  return n
+end
+
+local cu     = readCounter(KEYS[1])
+local hourly = readCounter(KEYS[2])
+local daily  = readCounter(KEYS[3])
+
+if cu + cuCost > cuMax then return 1 end
+if hourly + 1 > hourlyMax then return 2 end
+if daily + 1 > dailyMax then return 3 end
+
+redis.call('INCRBY', KEYS[1], cuCost)
+redis.call('INCR', KEYS[2])
+redis.call('INCR', KEYS[3])
+
+-- PTTL < 0 covers both "exists, no TTL" (-1) and "missing" (-2). The INCRs
+-- above guarantee existence, so a negative here means the TTL needs arming.
+if redis.call('PTTL', KEYS[1]) < 0 then redis.call('PEXPIRE', KEYS[1], ARGV[5]) end
+if redis.call('PTTL', KEYS[2]) < 0 then redis.call('PEXPIRE', KEYS[2], ARGV[6]) end
+if redis.call('PTTL', KEYS[3]) < 0 then redis.call('PEXPIRE', KEYS[3], ARGV[7]) end
+
+return 0
+`
+
+async function isRateLimited(bucket: MoralisBucket, cuCost: number): Promise<boolean> {
+  const r = getRedis()
+  if (r && !isRedisUnavailable()) {
+    try {
+      const { hourly: hKey, daily: dKey } = bucketKeys(bucket)
+      const { hourlyMax, dailyMax } = BUCKET_CAPS[bucket]
+      // cuKey() is evaluated HERE, immediately before the call, not at function
+      // entry — so a request that arrives after UTC midnight debits the new
+      // month. Requests ADMITTED just before the boundary and SENT just after
+      // are still charged to the old month; that overshoot is bounded by
+      // in-flight concurrency and is inherent to charging at admission.
+      const res = await r.eval(
+        ADMIT_LUA,
+        3,
+        cuKey(),
+        hKey,
+        dKey,
+        String(cuCost),
+        String(monthlyCuMax()),
+        String(hourlyMax),
+        String(dailyMax),
+        String(MONTHLY_TTL),
+        String(HOURLY_WINDOW),
+        String(DAILY_WINDOW),
+      )
+      const denied = Number(res) !== 0
+      if (!denied) noteLedgerWriteOk() // a 0 return means the INCRBY committed
+      return denied
+    } catch (err) {
+      // Fall through to the fail-closed check below — NOT to the memory ledger.
+      // But record it first: this is the ONLY place that learns the ledger is
+      // unwritable, and an unrecorded failure here is invisible everywhere else.
+      noteLedgerWriteFailed(err)
+    }
+  }
+
+  // Redis is CONFIGURED for this deployment but did not answer. Deny.
+  //
+  // Falling through to isRateLimitedMemory() here is what makes the ceiling
+  // bypassable: the in-memory tally is a DIFFERENT, EMPTY ledger. A Redis
+  // holding 2,000,000 CU plus one timeout means a fresh web or indexer process
+  // sees used=0 and sends the very request Redis would have refused — and
+  // nothing reconciles that outage spend when Redis comes back, so each process
+  // can burn another full ceiling. That is the same "degrade to the permissive
+  // path" shape as the original incident, just triggered by an outage instead
+  // of a config gap.
+  //
+  // Denying costs a degraded history tab (callers already fall back to the
+  // local index on 'rate_limited'); admitting costs unbounded metered spend
+  // with no way to detect it. Note isRedisUnavailable() is sticky until
+  // reconnect, so an outage denies for its duration by design.
+  //
+  // A deployment with NO Redis at all (EthScan) is a different case: its memory
+  // ledger IS the ledger of record, which is what scope:'per-ledger' documents.
+  if (process.env.REDIS_URL) return true
+
+  return isRateLimitedMemory(bucket, cuCost)
+}
+
+/** Pure assembler for one bucket's health row. Exported for the standalone logic test. */
+export function buildBucketState(
+  hourly: number | null,
+  daily: number | null,
+  caps: { hourlyMax: number; dailyMax: number },
+): Record<string, unknown> {
+  return {
+    hourly, hourlyMax: caps.hourlyMax,
+    daily, dailyMax: caps.dailyMax,
+    limited: (hourly !== null && hourly >= caps.hourlyMax) || (daily !== null && daily >= caps.dailyMax),
+  }
+}
+
+/**
+ * Per-bucket snapshot for the admin /api/health endpoint (exposed to routes via
+ * getDataProviderHealth in ./index). Read-only (plain GETs, no INCR) so it
+ * never consumes budget. Shows WHICH feature saturated — the visibility that turned every prior
+ * limiter incident from a multi-hour guess into a one-line diagnosis.
+ */
+export async function getMoralisHealthState(): Promise<Record<string, unknown>> {
+  const buckets: Record<string, unknown> = {}
+  let anyLimited = false
+  const r = getRedis()
+  const redisLive = !!r && !isRedisUnavailable()
+
+  for (const bucket of ['history', 'holders', 'assets'] as MoralisBucket[]) {
+    let hourly: number | null = null
+    let daily: number | null = null
+    // Source is tracked PER READING, not once for the whole response. A single
+    // global flag lied in both directions: one failed bucket read relabelled
+    // every other bucket 'memory' even though they came from Redis, and — worse
+    // — a failed monthly GET fell back to memCu.used (usually 0) while the label
+    // still said 'redis', so a Redis ledger sitting at its ceiling could be
+    // reported as used:0, limited:false, source:'redis'. Exactly the reading an
+    // operator would trust to conclude nothing was wrong.
+    let bucketSource: 'redis' | 'memory' = 'memory'
+    if (redisLive) {
+      try {
+        const { hourly: hKey, daily: dKey } = bucketKeys(bucket)
+        const [h, d] = await Promise.all([r!.get(hKey), r!.get(dKey)])
+        hourly = h ? Number(h) : 0
+        daily = d ? Number(d) : 0
+        bucketSource = 'redis'
+      } catch { /* Redis blip — fall through to the in-memory tally below */ }
+    }
+    // No Redis (EthScan) or a blip: report THIS PROCESS's in-memory counters
+    // instead of null. Reporting null was not merely a gap — buildBucketState
+    // computes `limited` as `hourly !== null && hourly >= max`, so a null made
+    // `limited` UNCONDITIONALLY false. EthScan therefore reported "not limited"
+    // no matter how much it had spent, and the same null made the worker's
+    // sharedBucketOverHeadroom() politeness check return false, removing its
+    // only brake. One missing value silently disabled both the alarm and the
+    // governor. Per-process (not fleet-wide) numbers, hence `source`.
+    if (hourly === null) {
+      const c = rollMemWindows(bucket)
+      hourly = c.hourly
+      daily = c.daily
+      bucketSource = 'memory'
+    }
+    const state = buildBucketState(hourly, daily, BUCKET_CAPS[bucket])
+    if (state.limited) anyLimited = true
+    buckets[bucket] = { ...state, source: bucketSource }
+  }
+
+  // Monthly CU ledger — the number that actually maps to the invoice.
+  const cuMax = monthlyCuMax()
+  let cuUsed = memCu.used
+  let cuSource: 'redis' | 'memory' = 'memory'
+  if (redisLive) {
+    try {
+      const v = await r!.get(cuKey())
+      cuUsed = v ? Number(v) : 0
+      cuSource = 'redis'
+    } catch { /* keep the in-memory figure AND the honest 'memory' label */ }
+  }
+  // An unwritable ledger IS limited: in that state isRateLimited denies every
+  // call. Reporting the frozen tally alone — 262,375 of 1,500,000, limited:false
+  // — is the reading that let the 2026-09 overage run for a week unnoticed.
+  const cuLimited = cuUsed >= cuMax || ledgerUnwritable
+  if (cuLimited) anyLimited = true
+
+  return {
+    disabled: process.env.MORALIS_DISABLED === 'true',
+    keyPresent: !!process.env.MORALIS_API_KEY,
+    buckets,
+    /**
+     * Rolled up from the per-reading sources, and it distinguishes three
+     * states rather than two. 'mixed' is the one that matters: it means some
+     * readings are fleet-wide and some are this process only, so the numbers
+     * in this response cannot be compared with each other. Collapsing that
+     * into 'memory' would understate it, and into 'redis' would be a lie of
+     * exactly the kind this field exists to prevent.
+     */
+    source: ((): 'redis' | 'memory' | 'mixed' => {
+      const all = [cuSource, ...Object.values(buckets).map((b) => (b as { source: string }).source)]
+      if (all.every((s) => s === 'redis')) return 'redis'
+      if (all.every((s) => s === 'memory')) return 'memory'
+      return 'mixed'
+    })(),
+    monthlyCu: {
+      month: monthKey(),
+      used: cuUsed,
+      max: cuMax,
+      pctUsed: cuMax > 0 ? Math.round((cuUsed / cuMax) * 1000) / 10 : null,
+      limited: cuLimited,
+      source: cuSource,
+      /**
+       * Whether the last admission could COMMIT to the ledger. False means
+       * `used` above is a frozen number, not a live tally — spend is happening
+       * (or being refused) without being counted. Read this BEFORE trusting
+       * `used`/`pctUsed`: a full noeviction Redis refuses the INCRBY while
+       * still answering the GET, so the tally looks healthy and is stale.
+       */
+      writable: !ledgerUnwritable,
+      /**
+       * ⚠ SCOPE: this ceiling is PER LEDGER, not per Moralis account.
+       *
+       * BNB's web + indexer share one Redis and therefore one ledger. ETH has
+       * no Redis at all, so each ETH process counts in its own memory. Four
+       * processes across two chains ⇒ a 2,000,000 ceiling permits up to ~6M CU
+       * against a single Moralis account, because nothing joins the ledgers.
+       *
+       * This is a real limit of the fix, not an oversight: a true account-wide
+       * ceiling needs shared state that ETH does not have. Provisioning Redis
+       * for ETH (Track C1) is what closes it, and would also fix the same blind
+       * spot in the rate limiter and the KV cache. Until then, size the ceiling
+       * with the multiplier in mind.
+       */
+      scope: 'per-ledger',
+      /** Costs are estimates until confirmed in the Moralis console. */
+      estimated: true,
+    },
+    limited: anyLimited,
+  }
+}
+
+type Acquired = { ok: true; headers: Record<string, string> } | { ok: false; reason: ProviderFailReason }
+
+/**
+ * Same gate as the old getAuthHeaders, but the caller learns WHY it failed:
+ * 1. Set MORALIS_DISABLED=true to kill all calls instantly (emergency off)
+ * 2. Redis-backed response cache (off-heap, shared across instances)
+ * 3. Redis-backed PER-BUCKET rate limiter (history / holders / assets, fleet-wide)
+ */
+async function acquire(bucket: MoralisBucket, cuCost: number): Promise<Acquired> {
+  if (process.env.MORALIS_DISABLED === 'true') return { ok: false, reason: 'disabled' }
+  const key = process.env.MORALIS_API_KEY
+  if (!key) return { ok: false, reason: 'not_configured' }
+  // A monthly-ceiling stop reports 'rate_limited' deliberately: every caller
+  // already degrades that to the local-index view, which is exactly the right
+  // behavior when the budget is gone. A new reason would need an exhaustive
+  // sweep of four Lazy components for no user-visible difference.
+  // The calling client's own budget (client-admission.ts), charged only here, where a call is billed: before the
+  // fleet-wide admission, so a client over its budget does not take a fleet slot either. When the fleet then refuses,
+  // the client's charge is given back, so it pays only for calls that reach the provider (Codex, round one).
+  const client = currentClientAdmission()
+  if (client && !(await client.admit())) return { ok: false, reason: 'rate_limited' }
+  if (await isRateLimited(bucket, cuCost)) {
+    await client?.release().catch(() => {})
+    return { ok: false, reason: 'rate_limited' }
+  }
+  return { ok: true, headers: { 'X-API-Key': key, 'Accept': 'application/json' } }
+}
+
+const fail = (reason: ProviderFailReason): { ok: false; reason: ProviderFailReason } => ({ ok: false, reason })
+
+type RawOwner = {
+  owner_address: string
+  balance: string | null
+  balance_formatted?: string | null
+  usd_value?: string | null
+  is_contract?: boolean
+  percentage_relative_to_total_supply?: number | string | null
+  owner_address_label?: string | null
+}
+
+/** Map Moralis /erc20/{addr}/owners rows → ProviderHolder[]. Pure — keep body identical to the .mjs. */
+export function mapMoralisOwners(items: RawOwner[]): TokenHoldersPage['holders'] {
+  return items
+    .filter((r) => r.owner_address && r.balance && r.balance !== '0')
+    .map((r) => ({
+      address: r.owner_address.toLowerCase(),
+      balance: String(r.balance),
+      balanceFormatted: r.balance_formatted ?? null,
+      usdValue: r.usd_value ?? null,
+      isContract: !!r.is_contract,
+      percentage: r.percentage_relative_to_total_supply != null
+        ? String(r.percentage_relative_to_total_supply)
+        : null,
+      label: r.owner_address_label ?? null,
+    }))
+}
+
+export function createMoralisAdapter(
+  cfg: DataProviderConfig,
+  ctx?: { currency?: string },
+): ProviderAdapter {
+  const CHAIN = cfg.moralisChain
+  const CURRENCY = ctx?.currency ?? ''
+  /**
+   * Cache-key namespace. Every provider cache key MUST carry this prefix.
+   *
+   * Without it, keys were bare (`history:0xabc:`) while `kvGet`/`kvSet` pass the
+   * key straight to Redis. Two hosts sharing one Redis would then collide: from
+   * A4b-2 the indexer resolves its own adapter against the SAME `REDIS_URL` as
+   * the web (`apps/indexer/src/backfill-worker.ts`, which dynamically imports
+   * this package; the indexer's REDIS_URL is wired in render.yaml), and it
+   * passes no `currency` ctx —
+   * so whichever host wrote first would decide the other's rendered summary
+   * (`"1.5 BNB transfer"` vs `"1.5 transfer"`, see summarize* below).
+   *
+   * `v2` also retires pre-`logIndex` cached transfer pages, whose JSON
+   * deserializes with `logIndex === undefined` and would otherwise be trusted
+   * as a well-formed TokenTransfersPage for the whole TTL.
+   */
+  const NS = `moralis:v2:${CHAIN}:${CURRENCY}`
+  return {
+    kind: 'moralis',
+
+    /**
+     * Wallet transaction history. Also returns total tx count from the response
+     * so no separate stats call is needed. Cost: ~148 CU — the single most
+     * expensive call in the system and ~85% of the Moralis bill.
+     */
+    async getAddressHistory(address: string, cursor?: string): Promise<ProviderResult<AddressHistoryPage>> {
+      const cacheKey = `${NS}:history:${address}:${cursor ?? ''}`
+      const cached = await cacheGetJson<AddressHistoryPage>(cacheKey)
+      if (cached !== undefined) {
+        // null = cached negative (a recent failed upstream attempt)
+        return cached === null ? fail('upstream_error') : { ok: true, data: cached }
+      }
+      const auth = await acquire('history', CU_COST.addressHistory)
+      if (!auth.ok) return auth
+      try {
+        const url = new URL(`${BASE}/wallets/${address}/history`)
+        url.searchParams.set('chain', CHAIN)
+        url.searchParams.set('limit', '25')  // match PAGE_SIZE for full page of results
+        url.searchParams.set('include_internal_transactions', '0')
+        if (cursor) url.searchParams.set('cursor', cursor)
+
+        const res = await fetch(url.toString(), {
+          headers: auth.headers,
+          next: { revalidate: 300 },
+          signal: AbortSignal.timeout(10000),
+        } as RequestInit)
+        if (!res.ok) {
+          logUpstreamFailure('wallets/:address/history', res.status)
+          await cacheSetNull(cacheKey); return fail('upstream_error')
+        }
+
+        const data = (await res.json()) as {
+          result: Array<{
+            hash: string
+            block_number: string
+            block_timestamp: string
+            from_address: string
+            to_address: string | null
+            value: string
+            gas_price: string
+            receipt_gas_used: string
+            category: string
+            summary: string
+            possible_spam: boolean
+            erc20_transfers?: Array<{
+              from_address: string
+              to_address: string
+              contract_address: string
+              token_name: string
+              token_symbol: string
+              token_decimals: string
+              value: string
+              value_formatted: string
+              direction: string
+            }>
+          }>
+          cursor: string | null
+          total?: number  // Moralis returns total count in history response
+        }
+
+        const histResult: AddressHistoryPage = {
+          txs: data.result.map(t => ({
+            hash: t.hash,
+            blockNumber: t.block_number,
+            blockTimestamp: t.block_timestamp,
+            fromAddress: t.from_address,
+            toAddress: t.to_address,
+            value: t.value,
+            gasPrice: t.gas_price,
+            gasUsed: t.receipt_gas_used,
+            category: t.category,
+            summary: summarizeMoralisHistory(t, CURRENCY),
+            possibleSpam: t.possible_spam,
+            erc20Transfers: (t.erc20_transfers ?? []).map(e => ({
+              fromAddress: e.from_address,
+              toAddress: e.to_address,
+              tokenAddress: e.contract_address,
+              tokenName: e.token_name,
+              tokenSymbol: e.token_symbol,
+              tokenDecimals: e.token_decimals,
+              value: e.value,
+              valueFormatted: e.value_formatted,
+              direction: e.direction,
+            })),
+          })),
+          cursor: data.cursor ?? null,
+          // /wallets/{addr}/history is cursor-paginated and returns no `total`; don't pass off the
+          // current page size as the grand total (that showed "25" for wallets with hundreds of txs).
+          totalTxs: data.total ?? 0,
+        }
+        await cacheSetJson(cacheKey, histResult)
+        return { ok: true, data: histResult }
+      } catch {
+        return fail('upstream_error')
+      }
+    },
+
+    async getAddressTokenBalances(address: string): Promise<ProviderResult<ProviderTokenBalance[]>> {
+      const cacheKey = `${NS}:balances:${address}`
+      const cached = await cacheGetJson<ProviderTokenBalance[]>(cacheKey)
+      if (cached !== undefined) {
+        return cached === null ? fail('upstream_error') : { ok: true, data: cached }
+      }
+      const auth = await acquire('assets', CU_COST.addressBalances)
+      if (!auth.ok) return auth
+      try {
+        const res = await fetch(
+          `${BASE}/${address}/erc20?chain=${CHAIN}&limit=20&exclude_spam=true`,
+          { headers: auth.headers, next: { revalidate: 300 }, signal: AbortSignal.timeout(10000) } as RequestInit,
+        )
+        if (!res.ok) {
+          logUpstreamFailure(':address/erc20', res.status)
+          await cacheSetNull(cacheKey); return fail('upstream_error')
+        }
+        const data = (await res.json()) as Array<{
+          token_address: string
+          symbol: string
+          name: string
+          logo: string | null
+          decimals: number
+          balance: string
+          balance_formatted: string | null
+          usd_value: string | null
+        }>
+        const balResult = data.map(t => ({
+          tokenAddress: t.token_address,
+          symbol: t.symbol,
+          name: t.name,
+          logo: t.logo,
+          decimals: t.decimals,
+          balance: t.balance ?? '0',
+          balanceFormatted: t.balance_formatted ?? null,
+          usdValue: t.usd_value,
+        }))
+        await cacheSetJson(cacheKey, balResult)
+        return { ok: true, data: balResult }
+      } catch {
+        return fail('upstream_error')
+      }
+    },
+
+    /**
+     * ERC-20 token transfer history for an address. Cost: ~25 CU.
+     */
+    async getAddressTokenTransfers(address: string, cursor?: string): Promise<ProviderResult<TokenTransfersPage>> {
+      const cacheKey = `${NS}:transfers:${address}:${cursor ?? ''}`
+      const cached = await cacheGetJson<TokenTransfersPage>(cacheKey)
+      if (cached !== undefined) {
+        return cached === null ? fail('upstream_error') : { ok: true, data: cached }
+      }
+      const auth = await acquire('assets', CU_COST.addressTransfers)
+      if (!auth.ok) return auth
+      try {
+        const url = new URL(`${BASE}/${address}/erc20/transfers`)
+        url.searchParams.set('chain', CHAIN)
+        url.searchParams.set('limit', '10')  // 10 instead of 25
+        if (cursor) url.searchParams.set('cursor', cursor)
+
+        const res = await fetch(url.toString(), {
+          headers: auth.headers,
+          next: { revalidate: 300 },
+          signal: AbortSignal.timeout(10000),
+        } as RequestInit)
+        if (!res.ok) {
+          logUpstreamFailure(':address/erc20/transfers', res.status)
+          await cacheSetNull(cacheKey); return fail('upstream_error')
+        }
+
+        const data = (await res.json()) as {
+          result: Array<{
+            transaction_hash: string
+            log_index?: string | number    // A4b R3: stable per-tx identity for backfill upserts
+            block_number: string
+            block_timestamp: string
+            from_address: string
+            to_address: string
+            address: string                 // contract address — v2.2 /erc20/transfers names it `address`
+            token_name: string
+            token_symbol: string
+            token_decimals: string
+            value: string
+            value_decimal: string | null    // human-readable amount; there is no `value_formatted` here
+          }>
+          cursor: string | null
+        }
+
+        const txResult: TokenTransfersPage = {
+          transfers: data.result.map(t => ({
+            txHash: t.transaction_hash,
+            // null unless upstream gives a genuine non-negative integer. A4b keys
+            // backfilled transfers on (scope, tx_hash, log_index), so anything
+            // else — absent, '', whitespace, negative, '1.5', 'abc' — MUST NOT
+            // reach the PK; the worker skips null rows instead of colliding.
+            // Normalized through Number so '007' and 7 agree on one key.
+            logIndex: normalizeLogIndex(t.log_index),
+            blockNumber: t.block_number,
+            blockTimestamp: t.block_timestamp,
+            fromAddress: t.from_address,
+            toAddress: t.to_address,
+            tokenAddress: t.address,
+            tokenName: t.token_name,
+            tokenSymbol: t.token_symbol,
+            tokenDecimals: t.token_decimals,
+            value: t.value,
+            valueFormatted: t.value_decimal ?? '0',
+          })),
+          cursor: data.cursor ?? null,
+        }
+        await cacheSetJson(cacheKey, txResult)
+        return { ok: true, data: txResult }
+      } catch {
+        return fail('upstream_error')
+      }
+    },
+
+    async getAddressNfts(address: string): Promise<ProviderResult<ProviderNft[]>> {
+      const cacheKey = `${NS}:nfts:${address}`
+      const cached = await cacheGetJson<ProviderNft[]>(cacheKey)
+      if (cached !== undefined) {
+        return cached === null ? fail('upstream_error') : { ok: true, data: cached }
+      }
+      const auth = await acquire('assets', CU_COST.addressNfts)
+      if (!auth.ok) return auth
+      try {
+        const res = await fetch(
+          `${BASE}/${address}/nft?chain=${CHAIN}&limit=25&media_items=false&exclude_spam=true`,
+          { headers: auth.headers, next: { revalidate: 300 }, signal: AbortSignal.timeout(10000) } as RequestInit,
+        )
+        if (!res.ok) {
+          logUpstreamFailure(':address/nft', res.status)
+          await cacheSetNull(cacheKey); return fail('upstream_error')
+        }
+        const data = (await res.json()) as {
+          result: Array<{
+            token_address: string
+            token_id: string
+            name: string
+            symbol: string
+            metadata: string | null
+            owner_of?: string
+            media?: { original_media_url?: string }
+          }>
+        }
+        // The response is for the wallet we asked about; an item Moralis attributes to a different
+        // owner is not that wallet's holding, so it is dropped rather than shown as theirs.
+        const owned = data.result.filter(n => !n.owner_of || n.owner_of.toLowerCase() === address.toLowerCase())
+        const result = owned.map(n => {
+          let metadata: Record<string, unknown> | null = null
+          try { metadata = n.metadata ? JSON.parse(n.metadata) : null } catch { /* ignore */ }
+          return {
+            tokenAddress: n.token_address,
+            tokenId: n.token_id,
+            name: n.name,
+            symbol: n.symbol,
+            metadata,
+            imageUrl: httpsUrl(metadata?.image) ?? httpsUrl(n.media?.original_media_url),
+          }
+        })
+        await cacheSetJson(cacheKey, result)
+        return { ok: true, data: result }
+      } catch {
+        return fail('upstream_error')
+      }
+    },
+
+    /**
+     * Top holders of an ERC20 token, highest balance first (Moralis pre-sorts).
+     * Cost: ~50 CU. Zero-holder results keep the old behavior byte-for-byte:
+     * cached as a negative + reported as a failure, so callers fall back to
+     * their local estimate exactly as they did under the null contract.
+     */
+    async getTokenHolders(tokenAddress: string): Promise<ProviderResult<TokenHoldersPage>> {
+      const cacheKey = `${NS}:owners:${tokenAddress}`
+      const cached = await cacheGetJson<TokenHoldersPage>(cacheKey)
+      if (cached !== undefined) {
+        return cached === null ? fail('upstream_error') : { ok: true, data: cached }
+      }
+      const auth = await acquire('holders', CU_COST.tokenHolders)
+      if (!auth.ok) return auth
+      try {
+        const url = new URL(`${BASE}/erc20/${tokenAddress}/owners`)
+        url.searchParams.set('chain', CHAIN)
+        url.searchParams.set('limit', String(TOKEN_HOLDERS_PAGE_SIZE))
+        const res = await fetch(url.toString(), {
+          headers: auth.headers, next: { revalidate: 300 }, signal: AbortSignal.timeout(10000),
+        } as RequestInit)
+        if (!res.ok) {
+          logUpstreamFailure('erc20/:token/owners', res.status)
+          await cacheSetNull(cacheKey); return fail('upstream_error')
+        }
+        const data = (await res.json()) as { total_supply?: string | null; result?: RawOwner[] }
+        const result: TokenHoldersPage = {
+          holders: mapMoralisOwners(data.result ?? []),
+          totalSupply: data.total_supply ?? null,
+        }
+        if (result.holders.length === 0) { await cacheSetNull(cacheKey); return fail('upstream_error') }
+        await cacheSetJson(cacheKey, result)
+        return { ok: true, data: result }
+      } catch {
+        return fail('upstream_error')
+      }
+    },
+
+    /**
+     * Total holder count of an ERC20 token (Moralis holder-stats). Cost: ~50 CU.
+     */
+    async getTokenHolderCount(tokenAddress: string): Promise<ProviderResult<number>> {
+      const cacheKey = `${NS}:holdercount:${tokenAddress}`
+      const cached = await cacheGetJson<number>(cacheKey)
+      if (cached !== undefined) {
+        return cached === null ? fail('upstream_error') : { ok: true, data: cached }
+      }
+      const auth = await acquire('holders', CU_COST.tokenHolderCount)
+      if (!auth.ok) return auth
+      try {
+        const res = await fetch(`${BASE}/erc20/${tokenAddress}/holders?chain=${CHAIN}`, {
+          headers: auth.headers, next: { revalidate: 300 }, signal: AbortSignal.timeout(10000),
+        } as RequestInit)
+        if (!res.ok) {
+          logUpstreamFailure('erc20/:token/holders', res.status)
+          await cacheSetNull(cacheKey); return fail('upstream_error')
+        }
+        const data = (await res.json()) as { totalHolders?: number }
+        if (typeof data.totalHolders !== 'number') { await cacheSetNull(cacheKey); return fail('upstream_error') }
+        await cacheSetJson(cacheKey, data.totalHolders)
+        return { ok: true, data: data.totalHolders }
+      } catch {
+        return fail('upstream_error')
+      }
+    },
+  }
+}

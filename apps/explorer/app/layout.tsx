@@ -1,0 +1,110 @@
+import type { Metadata, Viewport } from 'next'
+import { Inter } from 'next/font/google'
+import localFont from 'next/font/local'
+import Script from 'next/script'
+import './globals.css'
+import { Header } from '@/components/layout/Header'
+import { Footer } from '@/components/layout/Footer'
+import { WebMcpProvider } from '@/components/agent/WebMcpProvider'
+import { chainConfig } from '@/lib/chain'
+import { gaMeasurementId } from '@/lib/analytics'
+
+const inter = Inter({ subsets: ['latin'], variable: '--font-sans' })
+// JetBrains Mono, subset to Basic Latin plus the UI's arrows (fonts/OFL.txt): one 8 KB variable
+// file for weights 400-600 instead of Google's 32 KB latin file, which sat on the critical path
+// behind the CSS and cost ~450ms of Lighthouse mobile LCP. No ligatures, so hashes render as typed.
+// Not preloaded and `optional`: a second preloaded font made the first frame land before React's
+// reveal of the streamed page (a segment loading.tsx), deferring it ~300ms (late LCP + footer shift),
+// and a swap re-wraps long hashes. A cold first visit may show the fallback mono.
+const jetbrainsMono = localFont({
+  src: './fonts/JetBrainsMono-subset.woff2',
+  weight: '400 600',
+  display: 'optional',
+  preload: false,
+  variable: '--font-mono',
+  fallback: ['ui-monospace', 'SFMono-Regular', 'Menlo', 'Consolas', 'monospace'],
+  // The default Arial-metrics fallback is wrong for a monospace face.
+  adjustFontFallback: false,
+})
+
+export const metadata: Metadata = {
+  metadataBase: new URL(`https://${chainConfig.domain}`),
+  title: {
+    default: `${chainConfig.brandDomain} — ${chainConfig.tagline}`,
+    template: `%s — ${chainConfig.brandDomain}`,
+  },
+  description: `${chainConfig.brandDomain} is an alternative ${chainConfig.name} block explorer maintained by Measurable Data Token (MDT). Explore blocks, transactions, tokens, DEX trades, and more.`,
+  openGraph: {
+    title: `${chainConfig.brandDomain} — ${chainConfig.tagline}`,
+    description: `An open, independent ${chainConfig.name} explorer maintained by Measurable Data Token (MDT).`,
+    siteName: `${chainConfig.brandDomain} by MDT`,
+    type: 'website',
+    url: `https://${chainConfig.domain}`,
+  },
+  twitter: {
+    card: 'summary_large_image',
+    title: `${chainConfig.brandDomain} — ${chainConfig.tagline}`,
+    description: `An open, independent ${chainConfig.name} explorer maintained by Measurable Data Token (MDT).`,
+  },
+  alternates: {
+    canonical: '/',
+  },
+}
+
+// Follows the OS scheme (no toggle): the browser chrome and form controls switch with it, and the
+// theme-color of the address bar matches the page background in each scheme.
+export const viewport: Viewport = {
+  colorScheme: 'light dark',
+  themeColor: [
+    { media: '(prefers-color-scheme: light)', color: '#fbfbfc' },
+    { media: '(prefers-color-scheme: dark)', color: '#0b0b0f' },
+  ],
+}
+
+export default function RootLayout({ children }: { children: React.ReactNode }) {
+  const gaId = gaMeasurementId()
+  return (
+    <html
+      lang="en"
+      className={`${inter.variable} ${jetbrainsMono.variable}`}
+      style={{
+        // Both schemes' accents, as -l (light) and -d (dark). globals.css maps --acc* to one
+        // set per prefers-color-scheme: an inline --acc would beat any stylesheet rule.
+        '--acc-l': chainConfig.theme.accentHex,
+        '--acc-ink-l': chainConfig.theme.accentInk,
+        '--acc-t-l': chainConfig.theme.accentTint,
+        '--acc-on-l': chainConfig.theme.accentOn,
+        '--acc-d': chainConfig.theme.accentHexDark,
+        '--acc-ink-d': chainConfig.theme.accentInkDark,
+        '--acc-t-d': chainConfig.theme.accentTintDark,
+        '--acc-on-d': chainConfig.theme.accentOnDark,
+      } as React.CSSProperties}
+    >
+      <body>
+        {/* First tab stop: hidden until focused, then pinned above the sticky header (z-50). */}
+        <a href="#main" className="skip">Skip to content</a>
+        {/* Google Analytics, only when the deployment sets GA_MEASUREMENT_ID */}
+        {gaId && (
+          <>
+            <Script
+              src={`https://www.googletagmanager.com/gtag/js?id=${gaId}`}
+              strategy="afterInteractive"
+            />
+            <Script id="google-analytics" strategy="afterInteractive">
+              {`
+                window.dataLayer = window.dataLayer || [];
+                function gtag(){dataLayer.push(arguments);}
+                gtag('js', new Date());
+                gtag('config', '${gaId}');
+              `}
+            </Script>
+          </>
+        )}
+        <Header />
+        <main id="main" tabIndex={-1} className="mn">{children}</main>
+        <Footer />
+        <WebMcpProvider />
+      </body>
+    </html>
+  )
+}

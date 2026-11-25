@@ -1,0 +1,528 @@
+import { db, schema } from '@/lib/db'
+import { countTokenTransfers, selectTokenTransfers, TOKEN_TRANSFERS_MAX_ROWS } from '@/lib/token-transfers-query'
+import { eq } from 'drizzle-orm'
+import { cache } from 'react'
+import { notFound } from 'next/navigation'
+import { formatNumber, formatTokenAmount, formatUsdPrice, formatCompactUsd, formatPercent, tokenText, tokenTextOr, tokenUnit } from '@/lib/format'
+import { readDecimals, supplyText } from '@/lib/token-units'
+import { transfersEmptyState, TRANSFERS_EMPTY_TEXT } from '@/lib/transfers-empty-state'
+import { CopyButton } from '@/components/ui/CopyButton'
+import { Badge } from '@/components/ui/Badge'
+import { Pagination } from '@/components/ui/Pagination'
+import { AdReserve } from '@/components/ads/AdReserve'
+import Link from 'next/link'
+import type { Metadata } from 'next'
+import { analyzeTokenRisk, type RiskSignal } from '@/lib/token-risk'
+import { lookalikeOf, lookalikeNote } from '@/lib/lookalike'
+import { hasDirectionalControls, stripDirectionalControls } from '@/lib/directional-controls'
+import { anyLinkLike } from '@/lib/link-in-name'
+import { LinkInName } from '@/components/ui/LinkInName'
+import { tokenTypeLabel } from '@/lib/token-type-label'
+import { Contract } from 'ethers'
+import { getWebProvider } from '@/lib/rpc'
+import { readTokenNameAndSymbol } from '@/lib/token-text-call'
+import { chainConfig } from '@/lib/chain'
+import { getTokenMarketData } from '@/lib/market-data'
+import { getTokenHolders, EMPTY_HOLDERS } from '@/lib/holders'
+import { isStablecoinToken } from '@/lib/binance-referral'
+import { BreadcrumbJsonLd } from '@/components/seo/Breadcrumbs'
+import { HoldersLazy, HoldersFact } from './HoldersLazy'
+import { RiskSignals } from './RiskSignals'
+import { AddressLink } from '@/components/ui/AddressLink'
+import { swallow } from '@/lib/observability'
+import { shortHash, shortenAddress, toChecksumAddress } from '@/lib/address-display'
+
+const ERC20_ABI = [
+  'function decimals() view returns (uint8)',
+  'function totalSupply() view returns (uint256)',
+]
+
+type OnDemandToken = {
+  name: string
+  symbol: string
+  /** null = the decimals() read failed: unknown, never 18 (ETH USDT and USDC are 6). */
+  decimals: number | null
+  /** null = the totalSupply() read failed: unknown, never 0. */
+  totalSupply: string | null
+  holderCount: number
+  address: string
+  type: string
+}
+
+/** Resolve a fallback after `ms` so a slow DB/RPC call never blocks the page render. */
+function withTimeout<T>(promise: Promise<T>, ms: number, fallback: T): Promise<T> {
+  return Promise.race([
+    promise,
+    new Promise<T>((resolve) => setTimeout(() => resolve(fallback), ms)),
+  ])
+}
+
+// Wrapped in cache() so generateMetadata and the page render share one RPC round-trip
+// per request instead of each firing their own (which doubled the latency on
+// not-yet-indexed tokens).
+const fetchTokenFromRpc = cache(async (addr: string): Promise<OnDemandToken | null> => {
+  try {
+    const provider = await getWebProvider()
+    const contract = new Contract(addr, ERC20_ABI, provider)
+    // name() and symbol() through the bounded raw read, capped as the indexer caps them (token-text-call.ts):
+    // the contract chooses how much it returns, and this page prints both several times on every request.
+    const [{ name, symbol }, decimals, totalSupply] = await Promise.all([
+      readTokenNameAndSymbol(provider, addr),
+      contract.decimals().catch(() => null),
+      contract.totalSupply().catch(() => null),
+    ])
+    if (!name && !symbol) return null
+    return {
+      name: name ?? 'Unknown Token',
+      symbol: symbol ?? '???',
+      decimals: readDecimals(decimals),
+      totalSupply: totalSupply === null ? null : totalSupply.toString(),
+      holderCount: 0,
+      address: addr,
+      type: chainConfig.tokenStandard,
+    }
+  } catch (e) {
+    swallow('token/lookup', e)
+    return null
+  }
+})
+
+// The indexer persists name='Unknown'/symbol='???'/totalSupply='0' when its
+// first-sight RPC metadata fetch fails (apps/indexer/src/block-processor.ts) and
+// never re-resolves — so mega-tokens first indexed during a rate-limited window
+// (USDT/WBNB/CAKE) render forever as "Unknown (???)" with a 0 supply. When a
+// stored row still carries a sentinel, re-resolve it live from RPC for display.
+// Only the broken fields are overlaid (guarded against RPC's own failure values),
+// so healthy rows and partially-good rows are never regressed. fetchTokenFromRpc
+// is cache()'d, so generateMetadata and the page render share one round-trip.
+async function healPlaceholderMeta(
+  token: typeof schema.tokens.$inferSelect,
+  addr: string,
+): Promise<typeof schema.tokens.$inferSelect> {
+  if (token.name !== 'Unknown' && token.symbol !== '???') return token
+  const rpc = await fetchTokenFromRpc(addr)
+  if (!rpc) return token
+  return {
+    ...token,
+    name: token.name === 'Unknown' && rpc.name !== 'Unknown Token' ? rpc.name : token.name,
+    symbol: token.symbol === '???' && rpc.symbol !== '???' ? rpc.symbol : token.symbol,
+    totalSupply: token.totalSupply === '0' && rpc.totalSupply !== null && rpc.totalSupply !== '0' ? rpc.totalSupply : token.totalSupply,
+  }
+}
+
+// "Name (SYMBOL)", the token as the metadata and the breadcrumb JSON-LD name it. Crawlers and link previews read those
+// without the badge a visitor sees beside the header, so a name or symbol that reads as a URL or handle (lib/link-in-name)
+// is an advert there: the token is named by its short address instead. Directional controls are stripped, as on the page:
+// a title has no <bdi>, and U+202E + "TDSU" would title the page "USDT".
+function tokenIdentity(token: { name: string; symbol: string }, address: string): string {
+  return tokenText(token.symbol, token.name, address).linkLike
+    ? shortenAddress(address)
+    : `${stripDirectionalControls(token.name)} (${stripDirectionalControls(token.symbol)})`
+}
+
+const DIRECTION_CONTROLS_SIGNAL: RiskSignal = {
+  label: 'Direction controls',
+  ok: false,
+  severity: 'warn',
+  description: 'The name or symbol contains Unicode direction controls, which can make text display in a different order than it is stored. They are removed here.',
+}
+
+// Missing tokens return noindex metadata instead of throwing notFound(): on
+// this Next version, notFound() from generateMetadata still responds 200 with
+// the not-found UI, so status can't be trusted for SEO — noindex in the head
+// is what reliably keeps these off Google. The page body's notFound() still
+// renders the 404 UI.
+const NOT_FOUND_METADATA: Metadata = {
+  robots: { index: false, follow: false },
+}
+
+export async function generateMetadata({ params }: { params: Promise<{ address: string }> }): Promise<Metadata> {
+  const { address } = await params
+  if (!/^0x[0-9a-fA-F]{40}$/.test(address)) {
+    return { title: 'Token Not Found', ...NOT_FOUND_METADATA }
+  }
+  let token: typeof schema.tokens.$inferSelect | null = null
+  try {
+    const [row] = await db.select().from(schema.tokens).where(eq(schema.tokens.address, address.toLowerCase())).limit(1)
+    token = row ?? null
+  } catch (e) { swallow('token/meta', e) }  // DB error
+  if (!token) {
+    const rpcToken = await fetchTokenFromRpc(address.toLowerCase())
+    if (rpcToken) return {
+      title: tokenIdentity(rpcToken, address),
+      description: `${tokenIdentity(rpcToken, address)} token on ${chainConfig.name}.`,
+      alternates: { canonical: `/token/${address.toLowerCase()}` },
+    }
+    return { title: 'Token Not Found', ...NOT_FOUND_METADATA }
+  }
+  token = await healPlaceholderMeta(token, address.toLowerCase())
+  const standard = tokenTypeLabel(token.type, chainConfig.tokenStandard)
+  const identity = tokenIdentity(token, address)
+  return {
+    // No brand suffix: the layout title template (`%s — ${brandDomain}`) appends it
+    title: identity,
+    // No holder count: tokens.holder_count is a frozen snapshot (see lib/holder-labels.ts), not something to publish as current.
+    description: `${identity} ${standard} token on ${chainConfig.name}.`,
+    alternates: { canonical: `/token/${address.toLowerCase()}` },
+    openGraph: {
+      title: identity,
+      description: standard,
+    },
+  }
+}
+
+export const revalidate = 300
+
+const PAGE_SIZE = 25
+
+export default async function TokenDetailPage({
+  params,
+  searchParams,
+}: {
+  params: Promise<{ address: string }>
+  searchParams: Promise<{ page?: string }>
+}) {
+  const { address } = await params
+  if (!/^0x[0-9a-fA-F]{40}$/.test(address)) notFound()
+  const { page: pageStr } = await searchParams
+  const addr = address.toLowerCase()
+  // The list stops at TOKEN_TRANSFERS_MAX_ROWS, so a deeper ?page= gets its last page.
+  const page = Math.min(TOKEN_TRANSFERS_MAX_ROWS / PAGE_SIZE, Math.max(1, parseInt(pageStr ?? '1', 10) || 1))
+  const offset = (page - 1) * PAGE_SIZE
+
+  let token: typeof schema.tokens.$inferSelect | null = null
+  try {
+    const [row] = await db
+      .select()
+      .from(schema.tokens)
+      .where(eq(schema.tokens.address, addr))
+    token = row ?? null
+  } catch (e) { swallow('token/stats', e) }  // DB error
+
+  // If not in DB, fetch live from RPC (free — no Moralis CU cost)
+  let isLive = false
+  if (!token) {
+    const rpcToken = await fetchTokenFromRpc(addr)
+    if (rpcToken) {
+      token = rpcToken as typeof schema.tokens.$inferSelect
+      isLive = true
+    } else {
+      notFound()
+    }
+  } else {
+    // Indexed row exists but may carry stale "Unknown (???)" placeholders the
+    // indexer persisted on a failed first-sight metadata fetch (block-processor.ts).
+    // Re-resolve live so mega-tokens (USDT/WBNB/CAKE) don't render as "Unknown".
+    token = await healPlaceholderMeta(token, addr)
+  }
+
+  // Skip DB-heavy queries for live-fetched tokens (no local transfer data exists).
+  // For indexed tokens, time-box every heavy query so a slow aggregation on a
+  // mega-token (USDT/WBNB had millions of transfers) renders a partial page instead
+  // of hanging until the connection drops ("Connection closed").
+  // A live token has no local transfer data at all: an empty list there is the answer. A query that FAILED or timed
+  // out is null instead, which the table must not read as "no transfers" (lib/transfers-empty-state).
+  const NO_LOCAL_TRANSFERS: typeof schema.tokenTransfers.$inferSelect[] = []
+  // Market data is independent of local indexing (external DEX/CoinGecko), so fetch it for
+  // every real token — including live/not-yet-indexed ones. Holders need Moralis or local
+  // transfer data, so they stay gated to indexed tokens (matches the "live" banner).
+  // Holders: SSR always renders the labeled local net-flow estimate (0 Moralis CU) — safe for
+  // crawlers AND no-JS scrapers hitting the origin direct. Real browsers get accurate Moralis
+  // holders client-side via <HoldersLazy> → /api/internal/token/<addr>/holders (bots don't run
+  // the XHR, so they never spend CU — same model as the address tabs). This removes the last
+  // unguarded SSR Moralis call; the edge /token/ Managed Challenge + holders bucket cap remain.
+  const marketDataPromise = withTimeout(getTokenMarketData(addr).catch(() => null), 6000, null)
+  const [transfers, totalTransfersRaw, holdersResult, riskSignals] = isLive
+    ? [NO_LOCAL_TRANSFERS, -1, EMPTY_HOLDERS, [] as RiskSignal[]]
+    : await Promise.all([
+        withTimeout(
+          selectTokenTransfers(db, addr, { limit: PAGE_SIZE, offset })
+            .catch(() => null),
+          6000,
+          null,
+        ),
+        // Counts at most one row past the list. -1 = "unknown" (timed out /
+        // errored) so we never render a misleading "0 total".
+        withTimeout(
+          countTokenTransfers(db, addr)
+            .then(([r]) => r?.value ?? 0)
+            .catch(() => -1),
+          5000,
+          -1,
+        ),
+        withTimeout(getTokenHolders(addr, { skipProvider: true }).catch(() => EMPTY_HOLDERS), 6000, EMPTY_HOLDERS),
+        withTimeout(analyzeTokenRisk(addr).catch(() => [] as RiskSignal[]), 5000, [] as RiskSignal[]),
+      ])
+  const marketData = await marketDataPromise
+  const countKnown = totalTransfersRaw >= 0
+  const totalTransfers = countKnown ? totalTransfersRaw : 0
+  // More than the list serves reads as "10,000+".
+  const totalLabel = totalTransfers > TOKEN_TRANSFERS_MAX_ROWS
+    ? `${formatNumber(TOKEN_TRANSFERS_MAX_ROWS)}+`
+    : formatNumber(totalTransfers)
+  // When the exact count is unknown, estimate just enough to drive prev/next:
+  // assume another page exists only if this one came back full.
+  const pageRows = transfers ?? []
+  const transfersState = transfersEmptyState({ rows: transfers, count: totalTransfersRaw, offset })
+  const paginationTotal = Math.min(TOKEN_TRANSFERS_MAX_ROWS, countKnown
+    ? totalTransfers
+    : offset + pageRows.length + (pageRows.length === PAGE_SIZE ? PAGE_SIZE : 0))
+
+  // The DB column is NOT NULL, so only a token resolved live can have unknown decimals (a failed decimals() read).
+  const decimals = readDecimals(token.decimals)
+
+  // A token the indexer could not read (and the live re-resolve could not either) keeps its
+  // '???' / 'Unknown' placeholders: those are "missing", so the header says "—", not a name.
+  const nameText = tokenTextOr(token.name, '—')
+  const symbolText = tokenTextOr(token.symbol, '—')
+
+  // The header keeps the text, badged. Everywhere else the page prints the symbol (amounts, the supply line, captions, the
+  // holders table), a symbol that reads as a URL or handle (lib/link-in-name) is the token's short address, and any other
+  // is printed exactly as the page always did (even CJK, or the indexer's '???'): only the URL rule is applied here.
+  const shown = tokenText(token.symbol, token.name, addr)
+  const unit = tokenUnit(token.symbol, addr)
+  // DexScreener names the pair from the tokens' own symbols, so the same advert can be in it, as the text of an outbound link.
+  const pairLabel = marketData?.pairLabel && anyLinkLike(marketData.pairLabel) ? `${shortenAddress(addr)} pair` : marketData?.pairLabel
+
+  // Pure string check, so it holds on the live (RPC-only) path too, where analyzeTokenRisk is skipped.
+  const lookalike = lookalikeOf({ address: addr, symbol: token.symbol, name: token.name }, chainConfig.key)
+  // The page strips them, so what it shows is the stored order; the signal says they were there. A pure string check too.
+  const directional = hasDirectionalControls(token.name) || hasDirectionalControls(token.symbol)
+  const signals: RiskSignal[] = [
+    ...(lookalike ? [{ label: 'Lookalike', ok: false, severity: 'danger', description: lookalikeNote(lookalike) } as const] : []),
+    ...(directional ? [DIRECTION_CONTROLS_SIGNAL] : []),
+    ...riskSignals,
+  ]
+
+  // A flagged lookalike must not read as a stablecoin: that would put the stablecoin referral CTA on a scam token.
+  const tokenReferralContext = !lookalike && isStablecoinToken(addr, chainConfig)
+    ? 'stablecoin'
+    : 'token_research'
+
+  const checksummedAddr = toChecksumAddress(addr)
+
+  // One ad, rendered in exactly one of two DOM spots (never CSS order). Below the holders table,
+  // so on a phone it is not in the first viewport, where its description (mounted once the client
+  // config fetch lands) was the LCP element at ~4.8s. But when SSR has no holders rows HoldersLazy
+  // renders nothing and may mount a full Moralis table later, which would push an ad below it
+  // (and everything after) down: a large CLS. Then the ad keeps its old spot above the holders.
+  // The live/RPC path has no holders section, so it also takes the old spot, after the market block.
+  const adAfterHolders = !isLive && holdersResult.holders.length > 0
+  const tokenAd = (
+    <AdReserve
+      context={tokenReferralContext}
+      placement={tokenReferralContext === 'stablecoin' ? 'token_stablecoin' : 'token_research'}
+      variant="compact"
+      className="mb-6"
+    />
+  )
+
+  return (
+    <div className="max-w-7xl mx-auto px-4 py-8">
+      <BreadcrumbJsonLd items={[{ name: 'Tokens', href: '/token' }, { name: tokenIdentity(token, addr) }]} />
+      <div className="mb-5">
+        <p className="k">{'// '}token</p>
+        <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-2">
+          <h1 className="mr-1 min-w-0 [overflow-wrap:anywhere] text-[clamp(26px,3.4vw,40px)] font-bold leading-[1.05] tracking-[-0.03em] text-ink">
+            <bdi>{nameText}</bdi>
+            {symbolText !== '—' && <>{' '}<span className="font-mono font-semibold text-ink2"><bdi>{symbolText}</bdi></span></>}
+          </h1>
+          {/* Beside the h1, not in it: inside, "lookalike of USDT" would become part of the page's heading name. */}
+          {lookalike && (
+            <span className="badge badge-bad" title={lookalikeNote(lookalike)}>
+              lookalike<span className="sr-only"> of {lookalike.symbol}</span>
+            </span>
+          )}
+          {shown.linkLike && <LinkInName />}
+          <Badge variant="default">{tokenTypeLabel(token.type, chainConfig.tokenStandard)}</Badge>
+          <a
+            href={`${chainConfig.externalExplorerUrl}/token/${addr}`}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="sm:ml-auto rounded-[9px] border border-hair px-2.5 py-1 font-mono text-xs text-ink2 transition-colors hover:border-hair3"
+          >
+            View on {chainConfig.externalExplorer} ↗
+          </a>
+        </div>
+        <div className="mt-2 flex items-start font-mono text-[13px] text-ink2">
+          <span className="min-w-0 break-all pt-0.5">{checksummedAddr}</span>
+          <CopyButton text={checksummedAddr} />
+        </div>
+      </div>
+
+      {isLive && (
+        <div className="mb-4 flex items-center gap-2 rounded-xl border border-hair border-l-[3px] border-l-acc bg-card px-4 py-3 text-sm text-ink2">
+          <svg className="w-4 h-4 shrink-0 text-acc-ink" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><circle cx="12" cy="12" r="2"/><path d="M16.24 7.76a6 6 0 010 8.49m-8.48-.01a6 6 0 010-8.49m11.31-2.82a10 10 0 010 14.14m-14.14 0a10 10 0 010-14.14"/></svg>
+          <span>Showing live data from {chainConfig.name} RPC — this token is not yet in the local index. Transfer history and holder data are unavailable.</span>
+        </div>
+      )}
+
+      <dl className={`ledger mb-6 ${isLive ? '[--cols:2]' : '[--cols:3]'}`}>
+        <Fact label="Decimals">{decimals ?? '—'}</Fact>
+        <Fact label="Total Supply">{supplyText(token.totalSupply, decimals)}</Fact>
+        {!isLive && (
+          <HoldersFact address={addr} fallback={holdersResult.holderCount ?? token.holderCount} />
+        )}
+      </dl>
+
+      {marketData && (
+        <div className="mb-6">
+          <div className="mb-3 flex items-center justify-between">
+            <h2 className="font-semibold tracking-[-0.02em] text-ink">Market</h2>
+            {marketData.dexUrl ? (
+              <a
+                href={marketData.dexUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="text-xs text-acc-ink hover:underline"
+              >
+                {pairLabel} ↗
+              </a>
+            ) : pairLabel && (
+              <span className="text-xs text-mut">{pairLabel}</span>
+            )}
+          </div>
+          <dl className="ledger">
+            <Fact label="Price">
+              {marketData.priceUsd != null ? formatUsdPrice(marketData.priceUsd) : '—'}
+              {marketData.priceChange24h != null && (
+                <span
+                  className={`ml-2 text-xs ${
+                    marketData.priceChange24h >= 0
+                      ? 'text-live'
+                      : 'text-warn'
+                  }`}
+                >
+                  {formatPercent(marketData.priceChange24h)}
+                </span>
+              )}
+            </Fact>
+            <Fact label="24h Volume (pair)">
+              {marketData.volume24h != null ? formatCompactUsd(marketData.volume24h) : '—'}
+            </Fact>
+            <Fact label="Liquidity (pair)">
+              {marketData.liquidityUsd != null ? formatCompactUsd(marketData.liquidityUsd) : '—'}
+            </Fact>
+            <Fact label={marketData.marketCap != null ? 'Market Cap' : 'FDV'}>
+              {marketData.marketCap != null
+                ? formatCompactUsd(marketData.marketCap)
+                : marketData.fdv != null
+                  ? formatCompactUsd(marketData.fdv)
+                  : '—'}
+            </Fact>
+          </dl>
+          {marketData.circulatingSupply != null && (
+            <p className="text-xs text-mut mt-3">
+              Circulating supply: {formatNumber(Math.round(marketData.circulatingSupply))} {unit}
+            </p>
+          )}
+          {pairLabel && (
+            <p className="text-[11px] text-mut mt-2">
+              Price, 24h volume and liquidity are for the {pairLabel}; market cap and FDV are for the whole token.
+            </p>
+          )}
+          <p className="text-[11px] text-mut mt-2">
+            Market data via DexScreener{marketData.source.includes('coingecko') ? ' + CoinGecko' : ''}. For information only.
+          </p>
+        </div>
+      )}
+
+      {/* First of the ad's two positions (see tokenAd): above holders that may mount late. */}
+      {!adAfterHolders && tokenAd}
+
+      {/* Top Holders — SSR shows the local net-flow estimate (0 Moralis CU, crawler/no-JS safe);
+          HoldersLazy enhances to accurate Moralis balances client-side for real browsers. */}
+      {!isLive && (
+        <HoldersLazy
+          address={addr}
+          symbol={token.symbol}
+          decimals={token.decimals}
+          totalSupply={token.totalSupply ?? null}
+          initial={holdersResult}
+        />
+      )}
+
+      {/* Second of the ad's two positions (see tokenAd): below a holders table SSR already renders. */}
+      {adAfterHolders && tokenAd}
+
+      {/* Risk Signals */}
+      <RiskSignals signals={signals} />
+
+      {/* Token Transfers */}
+      <div className="flex items-center justify-between mb-3">
+        <h2 className="font-semibold tracking-[-0.02em] text-ink">
+          Token Transfers{' '}
+          <span className="text-mut font-normal text-sm">
+            {countKnown ? `(${totalLabel} total)` : '(showing latest)'}
+          </span>
+        </h2>
+      </div>
+      <div className="bg-card rounded-xl border border-hair overflow-hidden mb-4">
+        <div className="overflow-x-auto">
+        <table className="dt">
+          <caption className="sr-only">Token transfers for {unit}</caption>
+          <thead>
+            <tr>
+              <th scope="col">Tx Hash</th>
+              <th scope="col" className="hidden sm:table-cell">Block</th>
+              <th scope="col">From</th>
+              <th scope="col" className="hidden sm:table-cell">To</th>
+              <th scope="col">Amount</th>
+            </tr>
+          </thead>
+          <tbody>
+            {pageRows.map((t) => {
+              // Four places, a dust transfer as "<0.0001" rather than "0".
+              const amount = formatTokenAmount(t.value ?? '0', token.decimals, 4)
+              return (
+                <tr key={`${t.txHash}-${t.logIndex}`}>
+                  <td className="whitespace-nowrap">
+                    <Link
+                      href={`/tx/${t.txHash}`}
+                      className="text-acc-ink hover:underline"
+                    >
+                      {shortHash(t.txHash)}
+                    </Link>
+                  </td>
+                  <td className="text-mut hidden sm:table-cell">{formatNumber(t.blockNumber)}</td>
+                  <td>
+                    <AddressLink address={t.fromAddress} />
+                  </td>
+                  <td className="hidden sm:table-cell">
+                    <AddressLink address={t.toAddress} />
+                  </td>
+                  <td>
+                    {amount} {unit}
+                  </td>
+                </tr>
+              )
+            })}
+            {transfersState !== 'rows' && (
+              <tr>
+                <td colSpan={5} className="py-8 text-center font-sans text-mut">
+                  {TRANSFERS_EMPTY_TEXT[transfersState]}
+                </td>
+              </tr>
+            )}
+          </tbody>
+        </table>
+        </div>
+      </div>
+      <Pagination
+        page={page}
+        total={paginationTotal}
+        perPage={PAGE_SIZE}
+        baseUrl={`/token/${addr}`}
+      />
+    </div>
+  )
+}
+
+function Fact({ label, children }: { label: string; children: React.ReactNode }) {
+  return (
+    <div>
+      <dt className="k">{label}</dt>
+      <dd className="mt-1 break-words font-mono text-[15px] text-ink">{children}</dd>
+    </div>
+  )
+}

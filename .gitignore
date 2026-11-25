@@ -1,0 +1,33 @@
+node_modules/
+.next/
+dist/
+.env
+.env.*
+!.env.example
+!.env.docker.example
+*.env.local
+# wrangler's local secrets (apps/altscan-site: OAUTH_SECRET for astro dev)
+.dev.vars
+.turbo/
+*.tsbuildinfo
+.gstack/
+.render-api-key
+.claude/worktrees/
+.claude/scheduled_tasks.lock
+*.bak
+.design-review/
+.DS_Store
+
+# Internal working docs — kept local, never published to the open-source repo
+AGENTS.local.md
+HANDOFFS.md
+TODOS.md
+QA-*.md
+docs/superpowers/
+docs/cloudflare-waf-api-internal.md
+
+# Local machine fixup for this iCloud-synced clone — not part of the open-source repo
+scripts/local-postinstall.sh
+
+# Visual-companion brainstorm scratch (local only)
+.superpowers/

@@ -1,0 +1,624 @@
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest'
+import { eq, gte, lte, type SQL } from 'drizzle-orm'
+import { drizzle } from 'drizzle-orm/postgres-js'
+import { PgDialect } from 'drizzle-orm/pg-core'
+import { createMaintenanceConnection, schema } from '@altscan/db'
+import { selectByAddress, selectInTimeOrder } from './address-query'
+import { nftTransfersQuery } from './nft-transfers'
+
+// The mid-prune cases run the route itself on this suite's connection, and log the SQL it sends.
+const route = vi.hoisted(() => ({ db: undefined as unknown, sent: [] as { query: string; params: unknown[] }[] }))
+vi.mock('@/lib/api-auth', () => ({ authRequest: async () => ({ ok: true, limited: false }) }))
+vi.mock('@/lib/db', async () => ({ schema: (await import('@altscan/db')).schema, db: route.db }))
+
+/**
+ * POST /api/v1/query's `filter.address` against a REAL Postgres.
+ *
+ * `(from_address = $1 OR to_address = $1) ORDER BY block_number LIMIT n` has no
+ * index that serves both the filter and the order, so for an address the
+ * planner believes is busy it walks the block_number index and filters every
+ * row. When the address's rows sit at the far end of that walk — "first 10
+ * transfers" of an address that is only busy now — it streams the few early
+ * matches and then reads the rest of the table. On BNB that was ~95 statement
+ * timeouts an hour (15s), each after k < 10 rows had streamed, and every one of
+ * the 8 logged tx pages with k leading holes (postgres.js, #144) followed one of
+ * them on the same instance by under 2.1s.
+ *
+ * Gated on ADDRESS_QUERY_TEST_PG_URL. The tables are TEMP on a single
+ * non-recycled connection, so the suite cannot collide with another that shares
+ * the database. The DDL mirrors the indexes ensure-schema.ts creates in prod.
+ */
+const ENV = 'ADDRESS_QUERY_TEST_PG_URL'
+const PG_URL = process.env[ENV]
+
+const X = '0x' + '11'.repeat(20)   // busy in the NEWEST partition, 3 rows in the oldest
+const Z = '0x' + '22'.repeat(20)   // busy in the OLDEST partition, 3 rows in the newest
+const Y = '0x' + '33'.repeat(20)   // spread out: same-second blocks, a self-transfer, two tokens
+const W = '0x' + '44'.repeat(20)   // transactions only: 4 per block, sides alternating by tx_index
+const S = '0x' + '55'.repeat(20)   // a bot: sends to itself every other block, 4 rows in from others
+const D = '0x' + '66'.repeat(20)   // transactions, mid-prune only: scattered, 3 blocks above the cutoff
+const T1 = '0x' + 'e1'.repeat(20)
+const T2 = '0x' + 'e2'.repeat(20)
+const N1 = '0x' + '77'.repeat(20)   // NFTs tab: only BEP-1155s, 3,000 a side, more than one walk reads
+const N2 = '0x' + '88'.repeat(20)   // NFTs tab: BEP-721s among 1155s, and one sent to itself
+const NFT721 = '0x' + 'f7'.repeat(20)
+const NFT1155 = '0x' + 'f1'.repeat(20)
+
+// 10,000 blocks of 0.75s, truncated to whole seconds as on BNB, so consecutive
+// blocks share a timestamp. token_transfers is 4 partitions of 2,500 blocks.
+const TS = `timestamptz '2026-09-12 00:00:00+00' + floor(b * 0.75) * interval '1 second'`
+const h = (salt: number, n: number) => `((hashint4(b * 64 + i + ${salt})::bigint + 2147483648) % ${n})`
+const noise = (salt: number) =>
+  `CASE WHEN ${h(salt, 10)} < 3 THEN '0x' || md5('hot' || ${h(salt + 1, 1000)}) || '00000000'
+        ELSE '0x' || md5('a' || ${h(salt + 2, 50000)}) || '00000000' END`
+const other = `'0x' || md5('peer' || b) || '00000000'`
+
+// The query route's retention bound (getRetentionCutoff): block 5001 and its second,
+// 01:02:30, which block 5000 shares, so only the block bound keeps 5000 out.
+const CUTOFF_BLOCK = 5001
+const CUTOFF = [
+  gte(schema.transactions.blockNumber, CUTOFF_BLOCK),
+  gte(schema.transactions.timestamp, new Date('2026-09-12T01:02:30Z')),
+]
+
+const FIXTURE = `
+  CREATE TEMP TABLE token_transfers (
+    tx_hash VARCHAR(66) NOT NULL, log_index INTEGER NOT NULL DEFAULT 0,
+    token_address VARCHAR(42) NOT NULL, from_address VARCHAR(42) NOT NULL, to_address VARCHAR(42) NOT NULL,
+    value NUMERIC(78,0) NOT NULL DEFAULT 0, token_id NUMERIC(78,0),
+    block_number BIGINT NOT NULL, timestamp TIMESTAMPTZ NOT NULL
+  ) PARTITION BY RANGE (block_number);
+  CREATE TEMP TABLE token_transfers_p_0    PARTITION OF token_transfers FOR VALUES FROM (0)    TO (2500);
+  CREATE TEMP TABLE token_transfers_p_2500 PARTITION OF token_transfers FOR VALUES FROM (2500) TO (5000);
+  CREATE TEMP TABLE token_transfers_p_5000 PARTITION OF token_transfers FOR VALUES FROM (5000) TO (7500);
+  CREATE TEMP TABLE token_transfers_p_7500 PARTITION OF token_transfers FOR VALUES FROM (7500) TO (10000);
+
+  INSERT INTO token_transfers (tx_hash, log_index, token_address, from_address, to_address, block_number, timestamp)
+  SELECT '0x' || md5('t' || b || ':' || i) || md5('u' || b || ':' || i), i,
+         '0x' || md5('tok' || ${h(1, 200)}) || '00000000', ${noise(10)}, ${noise(20)}, b, ${TS}
+  FROM generate_series(0, 9999) b, generate_series(0, 19) i;
+
+  INSERT INTO token_transfers (tx_hash, log_index, token_address, from_address, to_address, block_number, timestamp)
+  SELECT '0x' || md5(addr || b) || md5('v' || b), 99, '${T1}',
+         CASE WHEN b % 2 = 0 THEN addr ELSE ${other} END,
+         CASE WHEN b % 2 = 1 THEN addr ELSE ${other} END, b, ${TS}
+  FROM (SELECT '${X}' AS addr, generate_series(7500, 9999, 3) AS b UNION ALL SELECT '${X}', unnest(ARRAY[10, 20, 31])
+        UNION ALL SELECT '${Z}', generate_series(0, 2499, 3) UNION ALL SELECT '${Z}', unnest(ARRAY[9971, 9980, 9990])) s;
+
+  INSERT INTO token_transfers (tx_hash, log_index, token_address, from_address, to_address, block_number, timestamp)
+  SELECT '0x' || md5('y' || b) || md5('w' || b), 98, CASE WHEN b % 3 = 0 THEN '${T1}' ELSE '${T2}' END,
+         CASE WHEN b % 2 = 0 OR b = 5121 THEN '${Y}' ELSE ${other} END,
+         CASE WHEN b % 2 = 1 THEN '${Y}' ELSE ${other} END, b, ${TS}
+  FROM (SELECT generate_series(0, 9999, 128) AS b UNION ALL SELECT generate_series(0, 9999, 128) + 1) s;
+
+  INSERT INTO token_transfers (tx_hash, log_index, token_address, from_address, to_address, block_number, timestamp)
+  SELECT '0x' || md5('s' || b) || md5('z' || b), 97, '${T1}',
+         CASE WHEN b % 2 = 0 THEN '${S}' ELSE ${other} END, '${S}', b, ${TS}
+  FROM (SELECT generate_series(0, 9999, 2) AS b UNION ALL SELECT unnest(ARRAY[3, 5001, 9993, 9997])) s;
+
+  -- The NFTs tab (nft-transfers.ts). token_id is set only on NFT transfers, as the indexer writes it.
+  INSERT INTO token_transfers (tx_hash, log_index, token_address, from_address, to_address, token_id, block_number, timestamp)
+  SELECT '0x' || md5('n1' || b) || md5('n1x' || b), 96, '${NFT1155}',
+         CASE WHEN b % 2 = 0 THEN '${N1}' ELSE ${other} END, CASE WHEN b % 2 = 1 THEN '${N1}' ELSE ${other} END, b, b, ${TS}
+  FROM generate_series(4000, 9999) b;
+  INSERT INTO token_transfers (tx_hash, log_index, token_address, from_address, to_address, token_id, block_number, timestamp)
+  SELECT '0x' || md5('n2' || b) || md5('n2x' || b), 95, CASE WHEN b % 7 = 0 THEN '${NFT721}' ELSE '${NFT1155}' END,
+         CASE WHEN b % 2 = 0 OR b = 7000 THEN '${N2}' ELSE ${other} END, CASE WHEN b % 2 = 1 OR b = 7000 THEN '${N2}' ELSE ${other} END,
+         b, b, ${TS}
+  FROM generate_series(2000, 9999) b WHERE b % 7 = 0 OR b % 3 = 0;
+  -- Other wallets' NFT traffic over 50 BEP-721 contracts, so the NFT rows as a whole are not one wallet's.
+  INSERT INTO token_transfers (tx_hash, log_index, token_address, from_address, to_address, token_id, block_number, timestamp)
+  SELECT '0x' || md5('c' || b || ':' || i) || md5('cx' || b || ':' || i), 90 + i, '0x' || md5('nftc' || (b % 50)) || '00000000',
+         '0x' || md5('cf' || b || i) || '00000000', '0x' || md5('ct' || b || i) || '00000000', b * 2 + i, b, ${TS}
+  FROM generate_series(0, 9999) b, generate_series(0, 1) i;
+  CREATE TEMP TABLE tokens (address VARCHAR(42) PRIMARY KEY, name TEXT, symbol TEXT, type TEXT NOT NULL);
+  INSERT INTO tokens VALUES ('${NFT721}', 'Art', 'ART', 'BEP721'), ('${NFT1155}', 'Items', 'ITM', 'BEP1155'),
+    ('${T1}', 'One', 'ONE', 'BEP20'), ('${T2}', 'Two', 'TWO', 'BEP20');
+  INSERT INTO tokens SELECT '0x' || md5('nftc' || i) || '00000000', 'C' || i, 'C' || i, 'BEP721' FROM generate_series(0, 49) i;
+  -- Enough other tokens that the planner reads one by its primary key, as on a real table.
+  INSERT INTO tokens SELECT '0x' || md5('ft' || i) || '00000000', 'F' || i, 'F' || i, 'BEP20' FROM generate_series(1, 20000) i;
+  ANALYZE tokens;
+
+  -- TT_NFT_INDEXES in ensure-schema.ts.
+  CREATE INDEX tt_nft_to_blk_idx ON token_transfers (to_address, block_number DESC) WHERE token_id IS NOT NULL;
+  CREATE INDEX tt_nft_from_blk_idx ON token_transfers (from_address, block_number DESC) WHERE token_id IS NOT NULL;
+  CREATE INDEX ON token_transfers (token_address);
+  CREATE INDEX ON token_transfers (from_address, timestamp DESC);
+  CREATE INDEX ON token_transfers (to_address, timestamp DESC);
+  CREATE INDEX ON token_transfers (token_address, timestamp DESC);
+  CREATE INDEX ON token_transfers (block_number);
+  CREATE INDEX ON token_transfers (tx_hash);
+  ANALYZE token_transfers;
+
+  CREATE TEMP TABLE transactions (
+    hash VARCHAR(66) PRIMARY KEY, block_number BIGINT NOT NULL,
+    from_address VARCHAR(42) NOT NULL, to_address VARCHAR(42),
+    value NUMERIC(78,18) NOT NULL DEFAULT 0, gas BIGINT NOT NULL DEFAULT 21000,
+    gas_price NUMERIC(36,0) NOT NULL DEFAULT 1, gas_used BIGINT NOT NULL DEFAULT 0,
+    input TEXT NOT NULL DEFAULT '0x', status BOOLEAN NOT NULL DEFAULT true, method_id VARCHAR(10),
+    tx_index INTEGER NOT NULL, nonce INTEGER, tx_type INTEGER,
+    timestamp TIMESTAMPTZ NOT NULL, body_pruned BOOLEAN NOT NULL DEFAULT false
+  );
+
+  INSERT INTO transactions (hash, block_number, from_address, to_address, tx_index, timestamp)
+  SELECT '0x' || md5('t' || b || ':' || i) || md5('u' || b || ':' || i), b, ${noise(30)}, ${noise(40)}, i, ${TS}
+  FROM generate_series(0, 9999) b, generate_series(0, 9) i;
+
+  INSERT INTO transactions (hash, block_number, from_address, to_address, tx_index, timestamp)
+  SELECT '0x' || md5(addr || b) || md5('v' || b), b,
+         CASE WHEN b % 2 = 0 THEN addr ELSE ${other} END,
+         CASE WHEN b % 2 = 1 THEN addr ELSE ${other} END, 99, ${TS}
+  FROM (SELECT '${X}' AS addr, generate_series(7500, 9999, 3) AS b UNION ALL SELECT '${X}', unnest(ARRAY[10, 20, 31])
+        UNION ALL SELECT '${Z}', generate_series(0, 2499, 3) UNION ALL SELECT '${Z}', unnest(ARRAY[9971, 9980, 9990])) s;
+
+  -- A self-send (5121) and a contract creation (to_address NULL, 6273) among Y's rows.
+  INSERT INTO transactions (hash, block_number, from_address, to_address, tx_index, timestamp)
+  SELECT '0x' || md5('y' || b) || md5('w' || b), b,
+         CASE WHEN b % 2 = 0 OR b = 5121 THEN '${Y}' ELSE ${other} END,
+         CASE WHEN b = 6273 THEN NULL WHEN b % 2 = 1 THEN '${Y}' ELSE ${other} END, 98, ${TS}
+  FROM (SELECT generate_series(0, 9999, 128) AS b UNION ALL SELECT generate_series(0, 9999, 128) + 1) s;
+  UPDATE transactions SET from_address = '${Y}' WHERE block_number = 6273 AND tx_index = 98;
+
+  -- Several of W's rows per block, so a page boundary falls inside a block. Inserted
+  -- in descending tx_index, so heap order is not the order a page must come out in.
+  INSERT INTO transactions (hash, block_number, from_address, to_address, tx_index, timestamp)
+  SELECT '0x' || md5('w' || b || ':' || i) || md5('x' || b || ':' || i), b,
+         CASE WHEN i % 2 = 0 THEN '${W}' ELSE ${other} END,
+         CASE WHEN i % 2 = 1 THEN '${W}' ELSE ${other} END, 50 + i, ${TS}
+  FROM generate_series(4000, 4029) b, generate_series(3, 0, -1) i;
+
+  -- S's to_address rows are nearly all self-sends, so no walk of that index finds 10 rows from others.
+  INSERT INTO transactions (hash, block_number, from_address, to_address, tx_index, timestamp)
+  SELECT '0x' || md5('s' || b) || md5('z' || b), b, CASE WHEN b % 2 = 0 THEN '${S}' ELSE ${other} END, '${S}', 97, ${TS}
+  FROM (SELECT generate_series(0, 9999, 2) AS b UNION ALL SELECT unnest(ARRAY[3, 5001, 9993, 9997])) s;
+
+  CREATE INDEX ON transactions (from_address, timestamp DESC);
+  CREATE INDEX ON transactions (to_address, timestamp DESC);
+  CREATE INDEX ON transactions (block_number);
+  CREATE INDEX ON transactions (block_number) WHERE body_pruned = false;
+  CREATE INDEX ON transactions (timestamp);
+  ANALYZE transactions;
+
+  -- What getRetentionCutoff() reads. No cutoff is published until a test sets one.
+  CREATE TEMP TABLE blocks (number BIGINT PRIMARY KEY, timestamp TIMESTAMPTZ NOT NULL);
+  INSERT INTO blocks SELECT b, ${TS} FROM generate_series(0, 9999) b;
+  CREATE TEMP TABLE indexer_cursor (id INTEGER PRIMARY KEY, compact_cutoff_block BIGINT);
+  INSERT INTO indexer_cursor VALUES (1, NULL);
+`
+
+type PlanNode = {
+  'Node Type': string
+  'Actual Rows': number
+  'Actual Loops': number
+  'Rows Removed by Filter'?: number
+  'Rows Removed by Index Recheck'?: number
+  Plans?: PlanNode[]
+}
+
+/** Heap rows the executor visited: returned by a scan, or read and discarded by its filter. */
+function rowsRead(node: PlanNode): number {
+  const scan = /Scan$/.test(node['Node Type']) && node['Node Type'] !== 'Bitmap Index Scan'
+  const own = scan
+    ? (node['Actual Rows'] + (node['Rows Removed by Filter'] ?? 0) + (node['Rows Removed by Index Recheck'] ?? 0)) * node['Actual Loops']
+    : 0
+  return (node.Plans ?? []).reduce((n, child) => n + rowsRead(child), own)
+}
+
+describe.skipIf(!PG_URL)('POST /api/v1/query filter.address — against a real Postgres', () => {
+  let conn: ReturnType<typeof createMaintenanceConnection>
+  let db: ReturnType<typeof drizzle<typeof schema>>
+
+  beforeAll(async () => {
+    if (!/test/i.test(new URL(PG_URL as string).pathname)) {
+      throw new Error(`${ENV} must name a disposable database (its name must contain "test")`)
+    }
+    conn = createMaintenanceConnection(PG_URL as string)
+    db = drizzle(conn, { schema })
+    route.db = drizzle(conn, { schema, logger: { logQuery: (query, params) => { route.sent.push({ query, params }) } } })
+    await conn.unsafe(FIXTURE)
+  }, 120_000)
+
+  afterAll(async () => {
+    await conn?.end({ timeout: 5 })
+  })
+
+  const tables = [
+    {
+      name: 'token_transfers',
+      table: schema.tokenTransfers,
+      oracle: `SELECT tx_hash || ':' || log_index AS key, block_number, token_address, from_address
+               FROM token_transfers WHERE from_address = $1 OR to_address = $1`,
+      key: (r: Record<string, unknown>) => `${r.txHash}:${r.logIndex}`,
+      filters: [
+        { label: 'no other filter', conditions: [] as SQL[], keep: () => true },
+        { label: 'tokenAddress', conditions: [eq(schema.tokenTransfers.tokenAddress, T1)], keep: (r: OracleRow) => r.token_address === T1 },
+        { label: 'from', conditions: [eq(schema.tokenTransfers.fromAddress, Y)], keep: (r: OracleRow) => r.from_address === Y },
+        {
+          label: 'blockFrom/blockTo',
+          conditions: [gte(schema.tokenTransfers.blockNumber, 2000), lte(schema.tokenTransfers.blockNumber, 8000)],
+          keep: (r: OracleRow) => Number(r.block_number) >= 2000 && Number(r.block_number) <= 8000,
+        },
+      ],
+    },
+    {
+      name: 'transactions',
+      table: schema.transactions,
+      oracle: `SELECT hash AS key, block_number, NULL AS token_address, from_address
+               FROM transactions WHERE from_address = $1 OR to_address = $1`,
+      key: (r: Record<string, unknown>) => String(r.hash),
+      filters: [
+        { label: 'no other filter', conditions: [] as SQL[], keep: () => true },
+        { label: 'from', conditions: [eq(schema.transactions.fromAddress, Y)], keep: (r: OracleRow) => r.from_address === Y },
+        {
+          label: 'blockFrom/blockTo',
+          conditions: [gte(schema.transactions.blockNumber, 2000), lte(schema.transactions.blockNumber, 8000)],
+          keep: (r: OracleRow) => Number(r.block_number) >= 2000 && Number(r.block_number) <= 8000,
+        },
+        { label: 'retention cutoff', conditions: CUTOFF, keep: (r: OracleRow) => Number(r.block_number) >= CUTOFF_BLOCK },
+      ],
+    },
+  ]
+  type OracleRow = { key: string; block_number: string; token_address: string | null; from_address: string }
+
+  describe.each(tables)('$name', ({ table, oracle, key, filters }) => {
+    // What prod hit: an address's first page read from the far end of the table, and
+    // a bot whose to_address rows are all its own self-sends (0x9999…0515 on BNB).
+    it.each([
+      ['asc', X],
+      ['desc', Z],
+      ['asc', S],
+      ['desc', S],
+    ])('reads O(limit) rows, not the table, in %s order for %s', async (order, address) => {
+      const q = selectByAddress(db, table, address, [], { order, limit: 10, offset: 0 })
+      const { sql: text, params } = q.toSQL()
+      const [{ 'QUERY PLAN': [explained] }] = await conn.unsafe(`EXPLAIN (ANALYZE, FORMAT JSON) ${text}`, params as never[])
+      expect(await q).toHaveLength(10)
+      // At least the 10 rows it returned, so a plan this walker cannot read fails loudly.
+      const read = rowsRead(explained.Plan)
+      expect(read).toBeGreaterThanOrEqual(10)
+      expect(read).toBeLessThan(100)
+    })
+
+    it.each([Y, S])('returns exactly what the OR query returns for %s, for every order, limit, offset and extra filter', async (address) => {
+      const all = (await conn.unsafe(oracle, [address])) as unknown as OracleRow[]
+      // One row per block per address in the fixture, so block order is total.
+      expect(new Set(all.map(r => r.block_number)).size).toBe(all.length)
+      let compared = 0
+      for (const { label, conditions, keep } of filters) {
+        for (const order of ['asc', 'desc']) {
+          const sorted = all.filter(keep).sort((a, b) =>
+            order === 'asc' ? Number(a.block_number) - Number(b.block_number) : Number(b.block_number) - Number(a.block_number))
+          for (const limit of [1, 7, 100]) {
+            for (const offset of [0, 5, 40]) {
+              const rows = await selectByAddress(db, table, address, conditions, { order, limit, offset })
+              const expected = sorted.slice(offset, offset + limit).map(r => r.key)
+              expect(rows.map(r => key(r as Record<string, unknown>)), `${label} ${order} limit=${limit} offset=${offset}`).toEqual(expected)
+              compared++
+            }
+          }
+        }
+      }
+      expect(compared).toBe(filters.length * 18)
+    })
+  })
+
+  // The address page's transactions tab: a busy address has several rows per block,
+  // and offset pages cut through them, so the order must be total.
+  describe('transactions with tieBreak tx_index', () => {
+    const tieBreak = schema.transactions.txIndex
+
+    it.each([
+      ['asc', X],
+      ['desc', Z],
+    ])('still reads O(limit) rows, not the table, in %s order', async (order, address) => {
+      const q = selectByAddress(db, schema.transactions, address, [], { order, limit: 10, offset: 0, tieBreak })
+      const { sql: text, params } = q.toSQL()
+      const [{ 'QUERY PLAN': [explained] }] = await conn.unsafe(`EXPLAIN (ANALYZE, FORMAT JSON) ${text}`, params as never[])
+      expect(await q).toHaveLength(10)
+      const read = rowsRead(explained.Plan)
+      expect(read).toBeGreaterThanOrEqual(10)
+      expect(read).toBeLessThan(100)
+    })
+
+    // The CSV export's read (app/api/v1/addresses/[address]/export): 1,000 rows, newest first. S has
+    // ~5,000 rows, nearly all self-sends on the to side; Z's newest rows sit at the far end.
+    it.each([S, Z])('the CSV export\'s 1,000-row read stays O(limit) and matches the OR query for %s', async (address) => {
+      const q = selectByAddress(db, schema.transactions, address, [], { order: 'desc', limit: 1000, offset: 0, tieBreak })
+      const { sql: text, params } = q.toSQL()
+      const [{ 'QUERY PLAN': [explained] }] = await conn.unsafe(`EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) ${text}`, params as never[])
+      expect(rowsRead(explained.Plan)).toBeLessThan(10 * 1000)
+      const expected = (await conn.unsafe(
+        `SELECT hash FROM transactions WHERE from_address = $1 OR to_address = $1
+         ORDER BY timestamp DESC, block_number DESC, tx_index DESC LIMIT 1000`, [address],
+      )) as unknown as { hash: string }[]
+      expect((await q).map(r => String((r as Record<string, unknown>).hash))).toEqual(expected.map(r => r.hash))
+    })
+
+    it('pages through several rows per block in exactly the OR query order', async () => {
+      const all = (await conn.unsafe(
+        `SELECT hash AS key, block_number, tx_index FROM transactions WHERE from_address = $1 OR to_address = $1`, [W],
+      )) as unknown as { key: string; block_number: string; tx_index: number }[]
+      expect(all).toHaveLength(120)
+      for (const order of ['asc', 'desc']) {
+        const sign = order === 'asc' ? 1 : -1
+        const sorted = [...all].sort((a, b) =>
+          sign * (Number(a.block_number) - Number(b.block_number) || a.tx_index - b.tx_index))
+        for (const limit of [1, 7, 25]) {
+          for (const offset of [0, 5, 26, 100]) {
+            const rows = await selectByAddress(db, schema.transactions, W, [], { order, limit, offset, tieBreak })
+            expect(rows.map(r => String((r as Record<string, unknown>).hash)), `${order} limit=${limit} offset=${offset}`)
+              .toEqual(sorted.slice(offset, offset + limit).map(r => r.key))
+          }
+        }
+      }
+    })
+  })
+
+  // filter.from / filter.to without filter.address. Ordered by block_number, the
+  // planner walked the block index and filtered every row: a filter.to of an
+  // ordinary BNB address timed out at 15s in one or both orders.
+  describe('transactions by one side (filter.from / filter.to)', () => {
+    const side = { from: schema.transactions.fromAddress, to: schema.transactions.toAddress }
+
+    it.each([
+      ['asc', 'from', X],
+      ['asc', 'to', X],
+      ['desc', 'from', Z],
+      ['desc', 'to', Z],
+    ] as const)('reads O(limit) rows, not the table, in %s order for %s = %s', async (order, s, address) => {
+      const q = selectInTimeOrder(db, schema.transactions, [eq(side[s], address)], { order, limit: 10, offset: 0 })
+      const { sql: text, params } = q.toSQL()
+      const [{ 'QUERY PLAN': [explained] }] = await conn.unsafe(`EXPLAIN (ANALYZE, FORMAT JSON) ${text}`, params as never[])
+      expect(await q).toHaveLength(10)
+      const read = rowsRead(explained.Plan)
+      expect(read).toBeGreaterThanOrEqual(10)
+      expect(read).toBeLessThan(100)
+    })
+
+    it.each([Y, S])('returns exactly the matching rows in block order for %s, for every side, order, limit, offset and the cutoff', async (address) => {
+      const all = (await conn.unsafe(
+        `SELECT hash AS key, block_number, from_address, to_address FROM transactions WHERE from_address = $1 OR to_address = $1`, [address],
+      )) as unknown as { key: string; block_number: string; from_address: string; to_address: string | null }[]
+      type Row = (typeof all)[number]
+      const cases = [
+        { label: 'from', conditions: [eq(side.from, address)], keep: (r: Row) => r.from_address === address },
+        { label: 'to', conditions: [eq(side.to, address)], keep: (r: Row) => r.to_address === address },
+        {
+          label: 'from and to',
+          conditions: [eq(side.from, address), eq(side.to, address)],
+          keep: (r: Row) => r.from_address === address && r.to_address === address,
+        },
+        {
+          label: 'to, from the retention cutoff',
+          conditions: [eq(side.to, address), ...CUTOFF],
+          keep: (r: Row) => r.to_address === address && Number(r.block_number) >= CUTOFF_BLOCK,
+        },
+      ]
+      let compared = 0
+      for (const { label, conditions, keep } of cases) {
+        const matching = all.filter(keep)
+        expect(matching.length, label).toBeGreaterThan(0)
+        for (const order of ['asc', 'desc']) {
+          const sorted = [...matching].sort((a, b) =>
+            order === 'asc' ? Number(a.block_number) - Number(b.block_number) : Number(b.block_number) - Number(a.block_number))
+          for (const limit of [1, 7, 100]) {
+            for (const offset of [0, 5, 40]) {
+              const rows = await selectInTimeOrder(db, schema.transactions, conditions, { order, limit, offset })
+              expect(rows.map(r => String((r as Record<string, unknown>).hash)), `${label} ${order} limit=${limit} offset=${offset}`)
+                .toEqual(sorted.slice(offset, offset + limit).map(r => r.key))
+              compared++
+            }
+          }
+        }
+      }
+      expect(compared).toBe(cases.length * 18)
+    })
+  })
+
+  // The same for token_transfers, plus filter.tokenAddress: a quiet BNB token timed
+  // out at 15s in both orders. T2 is Y's alone, one transfer every ~64 blocks.
+  describe('token_transfers by one column (filter.from / filter.to / filter.tokenAddress)', () => {
+    const col = {
+      from: schema.tokenTransfers.fromAddress, to: schema.tokenTransfers.toAddress, token: schema.tokenTransfers.tokenAddress,
+    }
+
+    it.each([
+      ['asc', 'from', X],
+      ['asc', 'to', X],
+      ['desc', 'from', Z],
+      ['asc', 'token', T2],
+      ['desc', 'token', T2],
+    ] as const)('reads O(limit) rows, not the table, in %s order for %s = %s', async (order, c, value) => {
+      const q = selectInTimeOrder(db, schema.tokenTransfers, [eq(col[c], value)], { order, limit: 10, offset: 0 })
+      const { sql: text, params } = q.toSQL()
+      const [{ 'QUERY PLAN': [explained] }] = await conn.unsafe(`EXPLAIN (ANALYZE, FORMAT JSON) ${text}`, params as never[])
+      expect(await q).toHaveLength(10)
+      const read = rowsRead(explained.Plan)
+      expect(read).toBeGreaterThanOrEqual(10)
+      expect(read).toBeLessThan(100)
+    })
+
+    it('returns exactly the matching rows in block order, for every column, order, limit and offset', async () => {
+      const cases = [
+        { label: 'from', conditions: [eq(col.from, Y)], where: 'from_address = $1', value: Y },
+        { label: 'to', conditions: [eq(col.to, Y)], where: 'to_address = $1', value: Y },
+        { label: 'tokenAddress', conditions: [eq(col.token, T2)], where: 'token_address = $1', value: T2 },
+      ]
+      let compared = 0
+      for (const { label, conditions, where, value } of cases) {
+        const matching = (await conn.unsafe(
+          `SELECT tx_hash || ':' || log_index AS key, block_number FROM token_transfers WHERE ${where}`, [value],
+        )) as unknown as { key: string; block_number: string }[]
+        // One row per block, so block order is total.
+        expect(new Set(matching.map(r => r.block_number)).size, label).toBe(matching.length)
+        for (const order of ['asc', 'desc']) {
+          const sorted = [...matching].sort((a, b) =>
+            order === 'asc' ? Number(a.block_number) - Number(b.block_number) : Number(b.block_number) - Number(a.block_number))
+          for (const limit of [1, 7, 100]) {
+            for (const offset of [0, 5, 40]) {
+              const rows = await selectInTimeOrder(db, schema.tokenTransfers, conditions, { order, limit, offset })
+              expect(rows.map(r => `${(r as Record<string, unknown>).txHash}:${(r as Record<string, unknown>).logIndex}`),
+                `${label} ${order} limit=${limit} offset=${offset}`).toEqual(sorted.slice(offset, offset + limit).map(r => r.key))
+              compared++
+            }
+          }
+        }
+      }
+      expect(compared).toBe(cases.length * 18)
+    })
+  })
+
+  // POST /api/v1/query with one key filter and a block range. The route turns the range into a
+  // timestamp range from the blocks around it, so the (column, timestamp) index starts and stops on it.
+  // Without that, T1 (a busy token: ~1,700 rows below block 2000, ~1,600 above 8000) read every
+  // row on the far side of the range before the first match. The /developer page documents this shape.
+  describe('a key filter with a block range', () => {
+    const range = { blockFrom: 2000, blockTo: 8000 }
+    const post = async (body: unknown) => {
+      const { POST } = await import('@/app/api/v1/query/route')
+      route.sent.length = 0
+      const res = await POST(new Request('http://x/api/v1/query', { method: 'POST', body: JSON.stringify(body) }))
+      expect(res.status).toBe(200)
+      return { rows: (await res.json()).data as Record<string, unknown>[], sent: route.sent[route.sent.length - 1] }
+    }
+    const readOf = async (sent: { query: string; params: unknown[] }) => {
+      const [{ 'QUERY PLAN': [explained] }] = await conn.unsafe(`EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) ${sent.query}`, sent.params as never[])
+      return rowsRead(explained.Plan)
+    }
+    // Every page of the range, as a set: rows of one block share a timestamp and have no order between them.
+    const allPages = async (body: Record<string, unknown>) => {
+      const keys: string[] = []
+      for (let offset = 0; ; offset += 100) {
+        const { rows } = await post({ ...body, limit: 100, offset })
+        keys.push(...rows.map(r => `${r.txHash ?? r.hash}:${r.logIndex ?? ''}`))
+        if (rows.length < 100) return keys.sort()
+      }
+    }
+    const oracleT1 = async () => ((await conn.unsafe(
+      `SELECT tx_hash || ':' || log_index AS k FROM token_transfers WHERE token_address = $1 AND block_number BETWEEN 2000 AND 8000`, [T1],
+    )) as unknown as { k: string }[]).map(r => r.k).sort()
+
+    it.each(['asc', 'desc'])('token_transfers tokenAddress + range reads O(limit) rows in %s order', async (orderBy) => {
+      const { rows, sent } = await post({ entity: 'token_transfers', orderBy, limit: 25, filter: { tokenAddress: T1, ...range } })
+      expect(rows).toHaveLength(25)
+      expect(rows.every(r => r.tokenAddress === T1 && Number(r.blockNumber) >= 2000 && Number(r.blockNumber) <= 8000)).toBe(true)
+      expect(await readOf(sent)).toBeLessThan(250)
+    })
+
+    it('returns every row of the range, exactly', async () => {
+      const want = await oracleT1()
+      expect(want.length).toBeGreaterThan(1000)
+      expect(await allPages({ entity: 'token_transfers', orderBy: 'asc', filter: { tokenAddress: T1, ...range } })).toEqual(want)
+    }, 60_000)
+
+    it('a gap in blocks around either bound loses no row', async () => {
+      await conn.unsafe('BEGIN')
+      try {
+        await conn.unsafe('DELETE FROM blocks WHERE number BETWEEN 1990 AND 2010 OR number BETWEEN 7990 AND 8010')
+        expect(await allPages({ entity: 'token_transfers', orderBy: 'desc', filter: { tokenAddress: T1, ...range } })).toEqual(await oracleT1())
+      } finally {
+        await conn.unsafe('ROLLBACK')
+      }
+    }, 60_000)
+
+    it.each([
+      ['transactions', { from: S }],
+      ['token_transfers', { address: S }],
+      ['transactions', { address: S }],
+    ])('%s %j + range reads O(limit) rows in asc order', async (entity, key) => {
+      const { rows, sent } = await post({ entity, orderBy: 'asc', limit: 25, filter: { ...key, ...range } })
+      expect(rows).toHaveLength(25)
+      expect(rows.every(r => Number(r.blockNumber) >= 2000)).toBe(true)
+      expect(await readOf(sent)).toBeLessThan(250)
+    })
+  })
+
+  // POST /api/v1/query mid-prune on BNB: retention has published a cutoff and DELETEd
+  // the rows below it, and VACUUM has not yet removed their index entries. An
+  // uncommitted DELETE leaves the same entries, and no scan can mark them dead, so a
+  // walk that starts below the cutoff visits the heap for each one. D's rows are
+  // scattered through the heap, one in ten, as a busy address's are in prod. Each
+  // half of the route's bound matters: the block bound starts the block_number index
+  // at the cutoff, the timestamp bound starts the (address, timestamp) indexes there.
+  // On BNB at 21:38Z on 10-21, `from` asc for 0x8894…d4e3 took 4,920 ms unbounded, 83 ms bounded.
+  describe('mid-prune', () => {
+    const cutoff = 8000
+    const post = async (body: unknown) => {
+      const { POST } = await import('@/app/api/v1/query/route')
+      route.sent.length = 0
+      const res = await POST(new Request('http://x/api/v1/query', { method: 'POST', body: JSON.stringify(body) }))
+      expect(res.status).toBe(200)
+      // transactions looks up the retention cutoff first; the page is the last query.
+      return { rows: (await res.json()).data as Record<string, unknown>[], sent: route.sent[route.sent.length - 1] }
+    }
+
+    // The suite's one connection, so the route runs inside this transaction too.
+    beforeAll(async () => {
+      await conn.unsafe('BEGIN')
+      await conn.unsafe(`
+        INSERT INTO transactions (hash, block_number, from_address, to_address, tx_index, timestamp)
+        SELECT '0x' || md5('d' || b || ':' || i) || md5('e' || b || ':' || i), b,
+               CASE WHEN i = 0 THEN '${D}' ELSE ${other} END, CASE WHEN i = 1 THEN '${D}' ELSE ${other} END, 200 + i, ${TS}
+        FROM generate_series(0, ${cutoff + 2}) b, generate_series(0, 9) i;
+        UPDATE indexer_cursor SET compact_cutoff_block = ${cutoff} WHERE id = 1;
+        DELETE FROM transactions WHERE block_number < ${cutoff};
+      `)
+    }, 120_000)
+
+    afterAll(async () => {
+      await conn?.unsafe('ROLLBACK')
+    })
+
+    it.each([
+      [{ orderBy: 'asc' }, 10],
+      [{ orderBy: 'asc', filter: { from: D } }, 3],
+      [{ orderBy: 'asc', filter: { address: D } }, 6],
+      [{ orderBy: 'desc', filter: { to: D } }, 3],
+    ])('transactions %j starts at the retention cutoff, not in the rows deleted below it', async (body, count) => {
+      const { rows, sent } = await post({ entity: 'transactions', limit: 10, ...body })
+      expect(rows).toHaveLength(count)
+      expect(rows.every(r => Number(r.blockNumber) >= cutoff)).toBe(true)
+      const [{ 'QUERY PLAN': [explained] }] = await conn.unsafe(`EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) ${sent.query}`, sent.params as never[])
+      expect(explained.Plan['Local Hit Blocks'] + explained.Plan['Local Read Blocks']).toBeLessThan(50)
+    })
+  })
+
+  // The address page's NFTs tab (nft-transfers.ts). As `(to = a OR from = a) AND token_id IS NOT NULL ORDER BY
+  // block_number` it read a busy wallet's every transfer to find that it had no NFTs.
+  describe('NFTs tab', () => {
+    // Rows read from tables only: rowsRead would also count the CTEs' Subquery Scans, which read nothing.
+    const tableRows = (n: PlanNode & { 'Relation Name'?: string }): number =>
+      (n['Relation Name'] && n['Node Type'] !== 'Bitmap Index Scan'
+        ? (n['Actual Rows'] + (n['Rows Removed by Filter'] ?? 0)) * n['Actual Loops'] : 0)
+      + (n.Plans ?? []).reduce((s, c) => s + tableRows(c), 0)
+    const readOf = async (q: SQL) => {
+      const { sql: text, params } = new PgDialect().sqlToQuery(q)
+      const [{ 'QUERY PLAN': [explained] }] = await conn.unsafe(`EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) ${text}`, params as never[])
+      return tableRows(explained.Plan)
+    }
+    const rowsOf = async (q: SQL) => Array.from(await db.execute(q)) as Record<string, unknown>[]
+
+    it.each([S, X, Z])('a busy wallet with no NFTs costs an empty index probe: %s', async (address) => {
+      expect(await rowsOf(nftTransfersQuery(address, 50))).toEqual([])
+      expect(await readOf(nftTransfersQuery(address, 50))).toBeLessThan(10)
+    })
+
+    it('a wallet with only BEP-1155s reads its NFT rows at most, never more, and shows none', async () => {
+      expect(await rowsOf(nftTransfersQuery(N1, 50))).toEqual([])
+      // 3,000 a side. With this few the planner reads each side through the NFT index and sorts it rather than
+      // walking it in order and stopping at NFT_SIDE_SCAN; either way the cost is the wallet's NFT rows.
+      expect(await readOf(nftTransfersQuery(N1, 50))).toBeLessThanOrEqual(2 * 3_000 + 10)
+    })
+
+    it('returns exactly what the OR query returns, newest BEP-721 first, a transfer to itself once', async () => {
+      const want = ((await conn.unsafe(
+        `SELECT tt.tx_hash FROM token_transfers tt JOIN tokens t ON t.address = tt.token_address AND t.type = 'BEP721'
+         WHERE (tt.to_address = $1 OR tt.from_address = $1) AND tt.token_id IS NOT NULL ORDER BY tt.block_number DESC LIMIT 500`, [N2],
+      )) as unknown as { tx_hash: string }[]).map(r => r.tx_hash)
+      const got = await rowsOf(nftTransfersQuery(N2, 500))
+      expect(want).toHaveLength(500)
+      expect(got.map(r => r.txHash)).toEqual(want)
+      expect(got.filter(r => Number(r.blockNumber) === 7000)).toHaveLength(1)
+    })
+  })
+})

@@ -1,0 +1,29 @@
+{
+  "name": "altscan-site",
+  "compatibility_date": "2025-01-01",
+  "compatibility_flags": ["nodejs_compat"],
+  // Astro's handler, wrapped so `/` can answer `Accept: text/markdown` (src/worker.ts).
+  "main": "./src/worker.ts",
+  // `/` is prerendered, so without run_worker_first the asset layer would serve it before the worker
+  // runs. Only the homepage pays a worker invocation; every other asset is still served directly.
+  "assets": { "binding": "ASSETS", "run_worker_first": ["/"] },
+  "routes": [{ "pattern": "altscan.io", "custom_domain": true }],
+  // /mcp kill switch: set to anything but "true" (dashboard or redeploy) to pause the endpoint.
+  "vars": { "MCP_ENABLED": "true" },
+  // Per-client limit for /mcp, keyed on the visitor IP: 60 calls a minute per Cloudflare location.
+  // A token caller is keyed on its address instead, and MCP_IP_RATE_LIMITER caps its IP at 120 a
+  // minute across all addresses, since addresses cost only a signature (src/lib/oauth.ts).
+  // OAUTH_RATE_LIMITER: per IP, on the OAuth endpoints that mint a client id, a code or a token.
+  "ratelimits": [
+    { "name": "MCP_RATE_LIMITER", "namespace_id": "1001", "simple": { "limit": 60, "period": 60 } },
+    { "name": "MCP_IP_RATE_LIMITER", "namespace_id": "1003", "simple": { "limit": 120, "period": 60 } },
+    { "name": "OAUTH_RATE_LIMITER", "namespace_id": "1002", "simple": { "limit": 20, "period": 60 } }
+  ],
+  // Single-use OAuth authorization codes (src/oauth-codes.ts). SQLite-backed, the kind the Free plan runs.
+  // The server also needs the Worker secret OAUTH_SECRET; without it every OAuth path is a 404.
+  "durable_objects": { "bindings": [{ "name": "OAUTH_CODES", "class_name": "OAuthCodes" }] },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["OAuthCodes"] }],
+  // One row per /mcp tool call (src/lib/mcp.ts usagePoint), queried by the pilot's usage report.
+  "analytics_engine_datasets": [{ "binding": "MCP_USAGE", "dataset": "altscan_mcp_calls" }],
+  "observability": { "enabled": true }
+}

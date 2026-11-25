@@ -1,0 +1,951 @@
+import { unwrapDbError } from '@altscan/db'
+import { db, schema } from '@/lib/db'
+import { eq, sql, inArray } from 'drizzle-orm'
+import { cache } from 'react'
+import { notFound } from 'next/navigation'
+import { formatNativeToken, formatGwei, formatNumber, formatUtc, formatShare, ordinal, timeAgo, safeBigInt, formatTokenAmount, tokenTextOr, UNKNOWN_TOKEN } from '@/lib/format'
+import { chainConfig } from '@/lib/chain'
+import { Badge } from '@/components/ui/Badge'
+import { CopyButton } from '@/components/ui/CopyButton'
+import { Icon } from '@/components/ui/Icon'
+import { AdReserve } from '@/components/ads/AdReserve'
+import Link from 'next/link'
+import type { Metadata } from 'next'
+import type { BinanceReferralPlacement } from '@/lib/binance-referral'
+import { approvalStandard, attemptedSummary, decodeTx, pendingSummary, safeTransferSymbol } from '@/lib/tx-decoder'
+import { getAddressLabel } from '@/lib/known-addresses'
+import { toChecksumAddress, shortenAddress } from '@/lib/address-display'
+import { AddressLink } from '@/components/ui/AddressLink'
+import { fetchTxFromRpc, fetchBlockFromRpc, type RpcTx } from '@/lib/rpc-fallback'
+import { getWebProvider } from '@/lib/rpc'
+import { computeGasBreakdown } from '@/lib/gas-breakdown'
+import { resolveTxViewKind, txOutcome, mayShowCalldataTransfer, atCurrentPrice, needsInputRefetch, resolveStoredInput, CALLDATA_TRANSFER_LABEL, TRUNCATED_INPUT_NOTE, TX_OUTCOME_LABEL } from '@/lib/tx-view'
+import { getTxBody, fetchTxInputFromRpc, type CachedLog } from '@/lib/body-cache'
+import { decodeEventName, decodeTopicParam } from '@/lib/event-decoder'
+import { decodeTransferLogs, decodeNftTransferLogs, splitTokenAddrs, capTransfers, TX_TRANSFERS_SHOWN } from '@/lib/erc20-transfers'
+import { selectTxInternals, capTxInternals, TX_INTERNALS_SHOWN } from '@/lib/tx-internal'
+import { fetchTokenMetadata, addrsNeedingMetadata, recordFetchedMetadata, PLACEHOLDER_SYMBOL, type KnownToken } from '@/lib/token-metadata'
+import { BreadcrumbJsonLd } from '@/components/seo/Breadcrumbs'
+import { swallow, swallowed, arrayShape } from '@/lib/observability'
+import { getBlockStrip } from '@/lib/block-strip'
+import { fetchNativeUsd } from '@/lib/native-price'
+import { txShareOfBlock } from '@/lib/tape'
+import { BlockStrip } from '@/components/tape/BlockStrip'
+
+// 60s (not 300): with ISR a transient miss — a just-broadcast tx during
+// RPC/indexer lag — caches its 404 for everyone until the next revalidate.
+// Tx content is immutable, so short revalidation costs one render/min per
+// actively-hit path while keeping the fresh-URL 404 window ≤ ~1-2 min.
+export const revalidate = 60
+// Without generateStaticParams a dynamic-segment route renders per-request
+// (verified live: no-store, no full-route ISR — `revalidate` above never
+// engaged) and streams a 200 shell before notFound() can throw, so missing
+// hashes soft-404'd. Empty array = prerender nothing at build; each path
+// static-renders on first request, is cached per `revalidate`, and a
+// notFound() render returns a real HTTP 404.
+export async function generateStaticParams(): Promise<Array<{ hash: string }>> {
+  return []
+}
+
+// Transfers shown under the summary card; a tx with more has the full list further down.
+const TRANSFER_PREVIEW = 3
+
+// Event logs a tx page lists, in every view. A refetched receipt is not capped by a query: one with
+// 5,003 logs rendered a 16 MB page that took 8 s, was too big for Next's ISR cache, and so re-rendered
+// on every request (ethscan-web failed its health check on 2026-10-30 rendering a dozen at once).
+const TX_LOGS_SHOWN = 50
+
+/**
+ * Confirmation depth is a property of the CHAIN, not of our index. Reading
+ * MAX(blocks.number) published our own indexer lag as if it were chain state —
+ * this page under-reported confirmations by however far behind we happened to
+ * be. Ask the node; fall back to the local high-water mark only if RPC is
+ * unreachable, so the figure degrades rather than disappearing.
+ */
+async function fetchChainTip(): Promise<number | null> {
+  try {
+    const provider = await getWebProvider()
+    const tip = await provider.getBlockNumber()
+    if (tip > 0) return tip
+  } catch (e) {
+    swallow('tx/chain-tip', e)
+  }
+  try {
+    const [row] = await db.select({ max: sql<number>`MAX(number)` }).from(schema.blocks)
+    return row?.max ?? null
+  } catch (e) {
+    swallow('tx/chain-tip-fallback', e)
+    return null
+  }
+}
+
+// One DB→RPC lookup per request, shared by generateMetadata and the page render
+// (cache() dedupes).
+const getTx = cache(async (hash: string) => {
+  let dbTx: typeof schema.transactions.$inferSelect | null = null
+  try {
+    const [row] = await db.select().from(schema.transactions).where(eq(schema.transactions.hash, hash)).limit(1)
+    dbTx = row ?? null
+  } catch (e) {
+    // Falling through to RPC is correct, but a DB outage here silently turns
+    // every indexed transaction into an RPC-served one — slower, and with the
+    // "outside our retention window" banner shown to everyone.
+    swallow('tx/db-lookup', e)
+  }
+  const rpcTx: RpcTx | null = !dbTx ? await fetchTxFromRpc(hash) : null
+  const kind = resolveTxViewKind(dbTx, rpcTx)   // 'local' | 'pruned' | 'rpc' | 'missing'
+  // Refetch input+logs on demand (cached) for BOTH bodyless views:
+  //  - 'pruned': a compact row whose heavy body retention removed in place;
+  //  - 'rpc'   : no row at all, so there are no local logs or token_transfers.
+  // The 'rpc' case used to skip this, which is why a transaction that moved 18
+  // token balances rendered with no transfers and no logs at all.
+  // null on RPC failure → the page degrades to compact + a note.
+  const body = kind === 'pruned' || kind === 'rpc' ? await getTxBody(hash) : null
+  return { dbTx, rpcTx, body, kind }
+})
+
+// Missing entities return noindex metadata instead of throwing notFound():
+// on this Next version, notFound() from metadata/body during an on-demand
+// static render still responds 200 with the not-found UI (and skips the ISR
+// cache), so status can't be trusted for SEO. noindex in the head is what
+// reliably keeps these off Google, and the previously indexed
+// "Transaction Not Found" page drops out on recrawl. The page body's
+// notFound() still renders the 404 UI.
+const NOT_FOUND_METADATA: Metadata = {
+  robots: { index: false, follow: false },
+}
+
+export async function generateMetadata({ params }: { params: Promise<{ hash: string }> }): Promise<Metadata> {
+  const { hash } = await params
+  if (!/^0x[0-9a-fA-F]{64}$/.test(hash)) {
+    return { title: 'Transaction Not Found', ...NOT_FOUND_METADATA }
+  }
+  const { dbTx, rpcTx } = await getTx(hash)
+  const tx = dbTx ?? rpcTx
+  if (!tx) {
+    return { title: 'Transaction Not Found', ...NOT_FOUND_METADATA }
+  }
+  const val = formatNativeToken(safeBigInt(tx.value))
+  // rpcTx is only fetched when the DB has no row, so it is the only source of a pending tx.
+  const outcome = txOutcome({ status: tx.status, pending: rpcTx?.pending })
+  return {
+    // No brand suffix: the layout title template (`%s — ${brandDomain}`) appends it
+    title: `Tx ${hash.slice(0, 18)}…`,
+    description: `${chainConfig.name} transaction: ${val} ${chainConfig.currency} from ${tx.fromAddress.slice(0, 12)}… to ${(tx.toAddress ?? 'contract creation').slice(0, 12)}…`,
+    alternates: { canonical: `/tx/${hash}` },
+    openGraph: {
+      title: `Transaction ${hash.slice(0, 18)}…`,
+      description: outcome === 'pending'
+        ? `${val} ${chainConfig.currency} · ${TX_OUTCOME_LABEL.pending}`
+        : `${val} ${chainConfig.currency} · Block #${tx.blockNumber} · ${TX_OUTCOME_LABEL[outcome]}`,
+    },
+  }
+}
+
+const KNOWN_SIGNATURES: Record<string, string> = {
+  '0xa9059cbb': 'transfer(address,uint256)',
+  '0x23b872dd': 'transferFrom(address,address,uint256)',
+  '0x095ea7b3': 'approve(address,uint256)',
+  '0x38ed1739': 'swapExactTokensForTokens(uint256,uint256,address[],address,uint256)',
+  '0x18cbafe5': 'swapExactTokensForETH(uint256,uint256,address[],address,uint256)',
+  '0x7ff36ab5': 'swapExactETHForTokens(uint256,address[],address,uint256)',
+  '0xe8e33700': 'addLiquidity(address,address,uint256,uint256,uint256,uint256,address,uint256)',
+  '0xbaa2abde': 'removeLiquidity(address,address,uint256,uint256,uint256,address,uint256)',
+  '0xd0e30db0': 'deposit()',
+  '0x2e1a7d4d': 'withdraw(uint256)',
+}
+
+const TX_TYPE_LABELS: Record<number, string> = {
+  0: 'Legacy',
+  1: 'EIP-2930 (Access List)',
+  2: 'EIP-1559 (Dynamic Fee)',
+  3: 'EIP-4844 (Blob)',
+}
+
+async function resolveMethodName(methodId: string): Promise<string | null> {
+  if (!methodId || methodId === '0x' || methodId.length < 10) return null
+  if (KNOWN_SIGNATURES[methodId]) return KNOWN_SIGNATURES[methodId]
+  try {
+    const res = await fetch(
+      `https://www.4byte.directory/api/v1/signatures/?hex_signature=${methodId}`,
+      { next: { revalidate: 300 }, signal: AbortSignal.timeout(5000) },
+    )
+    if (!res.ok) return null
+    const data = (await res.json()) as { results?: { text_signature: string }[] }
+    return data.results?.[0]?.text_signature ?? null
+  } catch {
+    return null
+  }
+}
+
+function tryDecodeInputAsUtf8(input: string): string | null {
+  if (!input || input === '0x') return null
+  try {
+    const hex = input.startsWith('0x') ? input.slice(2) : input
+    if (hex.length === 0) return null
+    const bytes = Buffer.from(hex, 'hex')
+    const decoded = bytes.toString('utf8')
+    const printableCount = decoded.split('').filter((c) => {
+      const code = c.charCodeAt(0)
+      return code >= 32 && code < 127
+    }).length
+    if (printableCount / decoded.length > 0.5 && printableCount > 3) {
+      return decoded
+    }
+    return null
+  } catch {
+    return null
+  }
+}
+
+function decodeTransferInput(input: string | null): { to: string; amount: bigint } | null {
+  if (!input || input.length !== 138) return null
+  try {
+    const to = ('0x' + input.slice(34, 74)).toLowerCase()
+    const amount = BigInt('0x' + input.slice(74))
+    if (!/^0x[0-9a-f]{40}$/.test(to)) return null
+    return { to, amount }
+  } catch {
+    return null
+  }
+}
+
+function formatUsd(nativeAmount: number, price: number): string {
+  const usd = nativeAmount * price
+  if (usd < 0.01 && usd > 0) return '< $0.01'
+  return `$${usd.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
+}
+
+export default async function TxDetailPage({
+  params,
+}: {
+  params: Promise<{ hash: string }>
+}) {
+  const { hash } = await params
+  if (!/^0x[0-9a-fA-F]{64}$/.test(hash)) notFound()
+
+  const { dbTx, rpcTx, body, kind } = await getTx(hash)
+  const tx = dbTx ?? rpcTx
+  if (!tx) notFound()
+
+  const fromRpc = !dbTx && !!rpcTx
+  const bodyPruned = !!dbTx?.bodyPruned
+  // No receipt yet: outcome, fee and gas are unknown. `placed` is whether the node has put the tx in a
+  // block (a pending tx has none, and its block, age and position are placeholders then; a node that
+  // is behind may know the block but not yet serve the receipt, and those facts are real).
+  const outcome = txOutcome({ status: tx.status, pending: rpcTx?.pending })
+  const pending = outcome === 'pending'
+  const placed = !pending || tx.blockNumber > 0
+
+  // token_transfers is compact-immortal → still local even for a pruned tx.
+  // logs are a prunable body → local when present, else from the refetched body.
+  const [dbLogs, transfers, internalTxs, methodName, nativePrice, chainTip, strip, fullInput] = await Promise.all([
+    (fromRpc || bodyPruned)
+      ? Promise.resolve([])
+      : db.select().from(schema.logs).where(eq(schema.logs.txHash, hash)).limit(TX_LOGS_SHOWN).catch(swallowed('tx/logs', [])),
+    fromRpc
+      ? Promise.resolve([])
+      : db.select().from(schema.tokenTransfers).where(eq(schema.tokenTransfers.txHash, hash)).limit(TX_TRANSFERS_SHOWN + 1).catch(swallowed('tx/transfers', [])),
+    // Local only: there is no RPC fallback for traces on the web tier. A tx
+    // indexed before the feature (or while the indexer was behind) has none.
+    fromRpc
+      ? Promise.resolve([])
+      : selectTxInternals(db, hash, tx.blockNumber).catch(swallowed('tx/internal', [])),
+    tx.methodId && tx.methodId !== '0x'
+      ? resolveMethodName(tx.methodId)
+      : Promise.resolve(null),
+    fetchNativeUsd(),
+    fetchChainTip(),
+    // An RPC-path tx has no local block, so no strip.
+    fromRpc ? Promise.resolve(null) : getBlockStrip(tx.blockNumber),
+    // The indexer stores only the first 500 characters of an input and leaves body_pruned false: ask the
+    // node for the rest of a long one (null on failure; the input then shows as cut, below).
+    needsInputRefetch(kind, dbTx?.input) ? fetchTxInputFromRpc(hash) : Promise.resolve(null),
+  ])
+
+  // Both bodyless views read the refetched body; a local tx reads the DB.
+  const usesBody = bodyPruned || fromRpc
+  // Effective input: the refetched body wins (DB input is '0x' when pruned, and
+  // absent entirely on the RPC path). An indexed tx's stored input may be cut at 500 characters:
+  // the node's full copy replaces it, or `inputTruncated` says what is shown is only a prefix.
+  const { input: effectiveInput, truncated: inputTruncated } = usesBody
+    ? { input: body ? body.input : tx.input, truncated: false }
+    : resolveStoredInput(tx.input, fullInput)
+  // Effective logs: refetched body logs when bodyless, else local DB logs. Both
+  // branches map to one shape so `txLogs.map(...)` in the render stays single-typed.
+  // The refetched receipt is listed only to TX_LOGS_SHOWN; transfers are decoded from all of it, below.
+  const bodyLogs: CachedLog[] = usesBody && body ? body.logs : []
+  const txLogs = usesBody
+    ? bodyLogs.slice(0, TX_LOGS_SHOWN).map((l) => ({ address: l.address, topic0: l.topic0, topic1: l.topic1, topic2: l.topic2, topic3: l.topic3, data: l.data }))
+    : dbLogs.map((l) => ({ address: l.address, topic0: l.topic0, topic1: l.topic1, topic2: l.topic2, topic3: l.topic3, data: l.data }))
+
+  const fee = BigInt(tx.gasUsed ?? 0) * BigInt(tx.gasPrice ?? 0)
+
+  // Base fee lives on the block, not the transaction. For an indexed tx it is
+  // one PK lookup; on the RPC path fetchBlockFromRpc already carries it. A tx in no block
+  // yet (`placed` is false: its blockNumber is the placeholder 0) has none to look up.
+  let baseFeePerGas: string | null = null
+  if (placed) {
+    try {
+      const [b] = await db.select({ baseFee: schema.blocks.baseFeePerGas })
+        .from(schema.blocks).where(eq(schema.blocks.number, tx.blockNumber)).limit(1)
+      baseFeePerGas = b?.baseFee ?? null
+    } catch (e) { swallow('tx/base-fee', e) }
+    if (baseFeePerGas == null) {
+      // Optional detail: fetchBlockFromRpc now throws on transport failure (a
+      // failed call is not an absent block), so degrade here rather than failing
+      // a tx page that otherwise rendered fine.
+      try {
+        const rpcBlock = await fetchBlockFromRpc(tx.blockNumber)
+        baseFeePerGas = rpcBlock?.baseFeePerGas ?? null
+      } catch (e) { swallow('tx/base-fee-rpc', e) }
+    }
+  }
+  const gasBreakdown = computeGasBreakdown(tx.gasUsed ?? 0n, tx.gasPrice ?? 0n, baseFeePerGas)
+
+  // ERC-721 transfers share topic0 with ERC-20 but index tokenId as a 4th
+  // topic, so they are decoded separately rather than dropped.
+  const nftTransfers = decodeNftTransferLogs(txLogs)
+  const hasInput = effectiveInput && effectiveInput !== '0x'
+  const decodedUtf8 = hasInput ? tryDecodeInputAsUtf8(effectiveInput) : null
+  const bodyUnavailable = usesBody && !body   // RPC refetch failed → degrade
+
+  // Gas usage percentage
+  const gasUsed = BigInt(tx.gasUsed ?? 0)
+  const gasLimit = BigInt(tx.gas ?? 0)
+  const MAX_REASONABLE_GAS = 50_000_000n
+  const gasPercent = !pending && gasLimit > 0n && gasLimit < MAX_REASONABLE_GAS && gasUsed < MAX_REASONABLE_GAS
+    ? Number((gasUsed * 100n) / gasLimit)
+    : null
+
+  // USD values
+  const bnbValue = Number(safeBigInt(tx.value)) / 1e18
+  const feeVal = Number(fee) / 1e18
+  // Today's price, whatever the tx's age: the figures say so (atCurrentPrice).
+  const valueUsd = nativePrice ? atCurrentPrice(formatUsd(bnbValue, nativePrice)) : null
+  const feeUsd = nativePrice ? atCurrentPrice(formatUsd(feeVal, nativePrice)) : null
+
+  // Confirmations
+  const confirmations = chainTip && placed ? chainTip - tx.blockNumber : null
+
+  // Nonce + txType — prefer DB, fallback to RPC
+  const nonce = tx.nonce ?? (fromRpc ? (rpcTx as RpcTx).nonce : null)
+  const txType = tx.txType ?? (fromRpc ? (rpcTx as RpcTx).txType : null)
+
+  // On the RPC path there are no token_transfers rows, so the transfers are
+  // decoded out of the receipt logs we just refetched. `transfers` (DB) wins
+  // when present — it is authoritative and already normalised.
+  const { shown: shownInternalTxs, truncated: internalTxsTruncated } = capTxInternals(internalTxs)
+  const { shown: effectiveTransfers, truncated: transfersTruncated } = capTransfers(transfers.length > 0
+    ? transfers.map((t) => ({ tokenAddress: t.tokenAddress, fromAddress: t.fromAddress, toAddress: t.toAddress, value: t.value ?? '0' }))
+    : decodeTransferLogs(usesBody ? bodyLogs : txLogs))
+
+  // Batch token lookups into single query (was N+1: one query per transfer)
+  // An approve is sent to its token, which no transfer names: resolve that token alongside the transfers'.
+  const approvedToken = tx.methodId === '0x095ea7b3' && tx.toAddress ? tx.toAddress.toLowerCase() : null
+  const { valid: uniqueTokenAddrs, invalid: badTokenAddrs } =
+    splitTokenAddrs([...new Set([...effectiveTransfers.map(t => t.tokenAddress), ...(approvedToken ? [approvedToken] : [])])])
+  if (badTokenAddrs.length > 0) {
+    // The column is notNull and the log decoder only emits strings, so an
+    // undefined here has come from a HOLE in the query result: postgres.js
+    // 3.4.8 left its row counter set after a query failed mid-result, and the
+    // next query on that connection started at index k (patched in
+    // patches/postgres@3.4.8.patch). dbTransfers is length/populated, so a
+    // recurrence shows whether holes are still the cause. JSON.stringify
+    // renders undefined as null inside an array, so the two are distinguished
+    // by hand here.
+    swallow('tx/token-addr-invalid', new Error(
+      `hash=${hash} fromRpc=${fromRpc} bodyPruned=${bodyPruned} `
+      + `dbTransfers=${arrayShape(transfers)} effective=${effectiveTransfers.length} `
+      + `invalid=[${badTokenAddrs.map(v => v === undefined ? 'undefined' : JSON.stringify(v)).join(', ')}]`,
+    ))
+  }
+  const tokenLookup = new Map<string, KnownToken>()
+  if (uniqueTokenAddrs.length > 0) {
+    let tokens: { address: string; symbol: string; decimals: number }[] | undefined
+    try {
+      tokens = await db.select({ address: schema.tokens.address, symbol: schema.tokens.symbol, decimals: schema.tokens.decimals })
+        .from(schema.tokens)
+        .where(inArray(schema.tokens.address, uniqueTokenAddrs))
+      for (const tok of tokens) tokenLookup.set(tok.address, tok)
+    } catch (e) {
+      const err = unwrapDbError(e)
+      // The bare TypeError named no transaction, so it could not be reproduced.
+      // rows= separates a result with holes (e.g. 5/2) from a failed query (none).
+      swallow('tx/token-lookup', `hash=${hash} addrs=${uniqueTokenAddrs.length} rows=${arrayShape(tokens)} `
+        + (err instanceof Error ? err.stack ?? err.message : String(err)))
+    }
+  }
+  // Anything the local `tokens` table could not name is resolved on-chain, so a
+  // transfer never has to render as a raw base-unit integer ("4280000000"
+  // where the answer is "4,280 USDC"). Cached; failures degrade, never throw.
+  const unnamed = addrsNeedingMetadata(uniqueTokenAddrs, tokenLookup)
+  if (unnamed.length > 0) {
+    recordFetchedMetadata(tokenLookup, await fetchTokenMetadata(unnamed))
+  }
+
+  const transferInfos: TransferInfo[] = effectiveTransfers.map((t) => {
+    const tok = tokenLookup.get(t.tokenAddress)
+    return {
+      tokenAddress: t.tokenAddress,
+      fromAddress: t.fromAddress,
+      toAddress: t.toAddress,
+      value: t.value ?? '0',
+      tokenSymbol: safeTransferSymbol(t.tokenAddress, tok?.symbol, chainConfig.key),
+      tokenDecimals: tok?.decimals ?? undefined,
+    }
+  })
+
+  // Fallback: decode transfer from input data, only where the logs could not be read (see mayShowCalldataTransfer).
+  if (tx.toAddress && mayShowCalldataTransfer({ methodId: tx.methodId, outcome, logsUnavailable: bodyUnavailable, knownTransfers: transferInfos.length })) {
+    const parsed = decodeTransferInput(effectiveInput ?? null)
+    if (parsed) {
+      let tokenSymbol: string | undefined
+      let tokenDecimals: number | undefined
+      try {
+        const [tok] = await db.select({ symbol: schema.tokens.symbol, decimals: schema.tokens.decimals })
+          .from(schema.tokens).where(eq(schema.tokens.address, tx.toAddress.toLowerCase())).limit(1)
+        if (tok) { tokenSymbol = safeTransferSymbol(tx.toAddress, tok.symbol, chainConfig.key); tokenDecimals = tok.decimals }
+      } catch { /* ignore */ }
+      transferInfos.push({
+        tokenAddress: tx.toAddress,
+        fromAddress: tx.fromAddress,
+        toAddress: parsed.to,
+        value: parsed.amount.toString(),
+        tokenSymbol,
+        tokenDecimals,
+        unverified: true,
+      })
+    }
+  }
+
+  const transfersAllShown = transferInfos.length <= TRANSFER_PREVIEW
+
+  // The approved token's symbol: not the indexer's placeholder, which names nothing.
+  const approvedSymbol = approvedToken && tokenLookup.get(approvedToken)?.symbol !== PLACEHOLDER_SYMBOL
+    ? safeTransferSymbol(approvedToken, tokenLookup.get(approvedToken)?.symbol, chainConfig.key)
+    : undefined
+
+  const decoded = decodeTx(
+    {
+      hash: tx.hash,
+      fromAddress: tx.fromAddress,
+      toAddress: tx.toAddress,
+      value: tx.value ?? '0',
+      methodId: tx.methodId,
+      status: tx.status,
+      methodName,
+      input: effectiveInput,
+      toTokenSymbol: approvedSymbol,
+      approvalStandard: approvalStandard(txLogs, approvedToken),
+    },
+    transferInfos,
+    chainConfig.currency
+  )
+
+  // The block strip's view of this tx (null for an RPC tx or a block that is not fully indexed).
+  const stripAt = strip ? txShareOfBlock(strip.txs, tx.txIndex) : null
+  const blockShare = stripAt && stripAt.pct !== null ? formatShare(stripAt.pct) : null
+  // 1-based, and one number for the eyebrow and the table row (tx_index is 0-based, and an identifier: the API keeps it).
+  const place = strip && stripAt ? { n: stripAt.pos + 1, of: strip.txs.length } : null
+  const headline = decoded?.summary
+    ? (pending ? pendingSummary(decoded.summary) : tx.status ? decoded.summary : attemptedSummary(decoded.summary))
+    : `Transaction ${tx.hash.slice(0, 8)}…${tx.hash.slice(-6)}`
+
+  return (
+    <>
+    <div className="max-w-7xl mx-auto px-4 pt-8">
+      <BreadcrumbJsonLd items={[{ name: 'Transactions', href: '/txs' }, { name: `Tx ${hash.slice(0, 18)}…` }]} />
+      <div className="mb-5">
+        <p className="k">
+          {'// '}transaction
+          {place && ` · ${ordinal(place.n)} of ${place.of} in block ${formatNumber(tx.blockNumber)}`}
+        </p>
+        <div className="mt-2 flex flex-wrap items-start gap-x-4 gap-y-2">
+          <h1 className="min-w-0 break-words text-[clamp(24px,2.6vw,34px)] font-bold leading-[1.1] tracking-[-0.02em] text-ink">{headline}</h1>
+          <a
+            href={`${chainConfig.externalExplorerUrl}/tx/${hash}`}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="sm:ml-auto rounded-[9px] border border-hair px-2.5 py-1 font-mono text-xs text-ink2 transition-colors hover:border-hair3"
+          >
+            View on {chainConfig.externalExplorer} ↗
+          </a>
+        </div>
+        <div className="mt-2 flex items-start font-mono text-[13px] text-ink2">
+          <span className="min-w-0 break-all pt-0.5">{tx.hash}</span>
+          <CopyButton text={tx.hash} />
+        </div>
+        <p className="mt-3 max-w-[60rem] text-[15px] leading-relaxed text-ink2">
+          Sent by <AddressLink address={tx.fromAddress} />.{' '}
+          {pending ? (
+            // No receipt: the outcome, the fee and the gas are all unknown, so none is claimed.
+            <><span className="font-semibold text-ink">Pending</span>, with no receipt yet.</>
+          ) : (
+            <>
+              <span className="font-semibold text-ink">{outcome === 'success' ? 'Succeeded' : 'Failed'}</span>{' '}
+              {timeAgo(new Date(tx.timestamp))} and paid {formatNativeToken(fee, 8)} {chainConfig.currency} in fees.
+              {gasUsed > 0n && gasUsed < MAX_REASONABLE_GAS && (
+                <> It used {formatNumber(Number(gasUsed))} gas{blockShare && `, ${blockShare}% of its block`}.</>
+              )}
+            </>
+          )}
+        </p>
+      </div>
+    </div>
+
+    {strip && (
+      <BlockStrip
+        txs={strip.txs}
+        blockNumber={tx.blockNumber}
+        gasLimit={strip.gasLimit}
+        chainName={chainConfig.name}
+        current={tx.txIndex}
+      />
+    )}
+
+    <div className={`max-w-7xl mx-auto px-4 pb-8${strip ? ' pt-6' : ''}`}>
+      <dl className="ledger [--cols:5] mb-4">
+        <Fact label="Status">
+          <Badge variant={outcome === 'success' ? 'success' : outcome === 'failed' ? 'fail' : 'pending'}>
+            {TX_OUTCOME_LABEL[outcome]}
+          </Badge>
+        </Fact>
+        <Fact
+          label="Block"
+          sub={confirmations != null && confirmations > 0 ? `${formatNumber(confirmations)} Confirmations` : undefined}
+        >
+          {placed ? (
+            <Link href={`/blocks/${tx.blockNumber}`} className="text-acc-ink hover:underline">
+              {formatNumber(tx.blockNumber)}
+            </Link>
+          ) : 'Pending'}
+        </Fact>
+        <Fact label="Age" sub={placed ? formatUtc(tx.timestamp) : undefined}>
+          {placed ? timeAgo(new Date(tx.timestamp)) : '—'}
+        </Fact>
+        <Fact label="Value" sub={valueUsd ?? undefined}>
+          {formatNativeToken(safeBigInt(tx.value))} {chainConfig.currency}
+        </Fact>
+        <Fact label="Fee" sub={pending ? undefined : feeUsd ?? undefined}>
+          {pending ? '—' : <>{formatNativeToken(fee, 8)} {chainConfig.currency}</>}
+        </Fact>
+      </dl>
+
+      <p className="mb-6 flex flex-wrap items-center gap-x-2 gap-y-1 font-mono text-[13px]">
+        <span className="k">From</span>
+        <AddressLink address={tx.fromAddress} />
+        <span className="text-mut" aria-hidden="true">→</span>
+        <span className="k">To</span>
+        {tx.toAddress ? (
+          <AddressLink address={tx.toAddress} />
+        ) : (
+          <span className="text-mut">Contract Creation</span>
+        )}
+      </p>
+
+      {fromRpc && (
+        <div className="mb-4 flex items-center gap-2 rounded-xl border border-hair border-l-[3px] border-l-acc bg-card px-4 py-3 text-sm text-ink2">
+          <Icon name="bolt" className="h-4 w-4 text-acc-ink" />
+          <span>
+            {pending
+              ? <>Fetched live from {chainConfig.name} — this transaction is pending, so we have not indexed it yet.</>
+              : <>Fetched live from {chainConfig.name} — this transaction is outside our local retention window.</>}
+          </span>
+        </div>
+      )}
+
+      {bodyPruned && !bodyUnavailable && (
+        <div className="mb-4 flex items-center gap-2 rounded-xl border border-hair border-l-[3px] border-l-acc bg-card px-4 py-3 text-sm text-ink2">
+          <Icon name="bolt" className="h-4 w-4 text-acc-ink" />
+          <span>Input data &amp; event logs fetched live from {chainConfig.name} — this transaction is older than our local body-retention window.</span>
+        </div>
+      )}
+      {/* A pending tx has no receipt, so no logs yet: the pending banner above already says so. */}
+      {bodyUnavailable && !pending && (
+        <div className="mb-4 flex items-center gap-2 rounded-xl border border-hair border-l-[3px] border-l-warn bg-card px-4 py-3 text-sm text-ink2">
+          <Icon name="clock" className="h-4 w-4 text-warn" />
+          <span>Input data &amp; event logs are temporarily unavailable — try again shortly. The transaction summary below is unaffected.</span>
+        </div>
+      )}
+
+      {transferInfos.length > 0 && (
+        // Up to TRANSFER_PREVIEW transfers are the whole list, shown once here. Past that this is a
+        // preview and the full list (id="token-transfers") follows the detail table.
+        <div
+          id={transfersAllShown ? 'token-transfers' : undefined}
+          className={`mb-6 rounded-xl border border-hair bg-card p-4${transfersAllShown ? ' scroll-mt-28' : ''}`}
+        >
+          <div className="mb-3 flex items-baseline justify-between gap-3">
+            <h2 className="font-semibold tracking-[-0.02em] text-ink">
+              Token Transfers{transfersAllShown && ` (${transferInfos.length})`}
+            </h2>
+            {!transfersAllShown && (
+              <a href="#token-transfers" className="shrink-0 text-sm text-acc-ink hover:underline">
+                All {transferInfos.length}{transfersTruncated ? '+' : ''} transfers <span aria-hidden="true">↓</span>
+              </a>
+            )}
+          </div>
+          <div className="space-y-2">
+            {transferInfos.slice(0, TRANSFER_PREVIEW).map((t, i) => <TransferRow key={i} t={t} />)}
+          </div>
+        </div>
+      )}
+
+      {/* Failed only: a plain transfer always uses 100% of its gas limit, so gas % is no sign of failure. */}
+      {outcome === 'failed' && (
+        <AdReserve
+          context="tx_failed"
+          placement="tx_failed"
+          variant="compact"
+          className="mb-6"
+        />
+      )}
+
+      <dl className="mb-6 divide-y divide-hair rounded-xl border border-hair bg-card">
+        <Row
+          label="From"
+          value={toChecksumAddress(tx.fromAddress)}
+          mono copy
+          link={`/address/${tx.fromAddress}`}
+          addressLabel={getAddressLabel(tx.fromAddress)}
+          copyReferralPlacement="address_copy"
+        />
+        <Row
+          label="To"
+          value={tx.toAddress ? toChecksumAddress(tx.toAddress) : 'Contract Creation'}
+          mono
+          copy={!!tx.toAddress}
+          link={tx.toAddress ? `/address/${tx.toAddress}` : undefined}
+          addressLabel={tx.toAddress ? getAddressLabel(tx.toAddress) : null}
+          copyReferralPlacement={tx.toAddress ? 'address_copy' : undefined}
+        />
+        <Row
+          label="Gas Price"
+          value={`${formatGwei(BigInt(tx.gasPrice ?? 0))} Gwei`}
+          mono
+        />
+        {gasBreakdown && (
+          <>
+            <Row
+              label="Base / Priority Fee"
+              value={`${formatGwei(gasBreakdown.baseFeePerGas)} Gwei base · ${formatGwei(gasBreakdown.effectiveGasPrice - gasBreakdown.baseFeePerGas)} Gwei tip`}
+              mono
+            />
+            <RowShell label="Burnt Fees" mono>
+              <Icon name="flame" className="mr-1 inline h-4 w-4 align-[-3px] text-warn" />{formatNativeToken(gasBreakdown.burnt, 8)} {chainConfig.currency}
+              <span className="ml-2 text-xs text-mut">
+                validator received {formatNativeToken(gasBreakdown.priorityTip, 8)} {chainConfig.currency}
+              </span>
+            </RowShell>
+          </>
+        )}
+        <RowShell label="Gas Used / Limit" mono>
+          <span>
+            {gasUsed > 0n && gasUsed < MAX_REASONABLE_GAS ? formatNumber(Number(gasUsed)) : '—'}
+            {' / '}
+            {gasLimit > 0n && gasLimit < MAX_REASONABLE_GAS ? formatNumber(Number(gasLimit)) : '—'}
+          </span>
+          {gasPercent != null && (
+            <span className="ml-2 text-xs text-mut">({gasPercent}%)</span>
+          )}
+          {gasPercent != null && (
+            <div className="mt-1.5 h-1.5 w-48 max-w-full overflow-hidden rounded-full bg-acc-t">
+              <div
+                className="h-full rounded-full bg-acc"
+                style={{ width: `${Math.min(gasPercent, 100)}%` }}
+              />
+            </div>
+          )}
+        </RowShell>
+        {tx.methodId && tx.methodId !== '0x' && !(decodedUtf8 && !methodName) && (
+          <Row
+            label="Method"
+            value={methodName ? `${methodName} (${tx.methodId})` : tx.methodId}
+            mono
+          />
+        )}
+        {nonce != null && (
+          <Row label="Nonce" value={String(nonce)} mono />
+        )}
+        {placed && <Row label="Position In Block" value={place ? `${place.n} of ${place.of}` : String(tx.txIndex + 1)} mono />}
+        {txType != null && (
+          <Row label="Transaction Type" value={TX_TYPE_LABELS[txType] ?? `Type ${txType}`} />
+        )}
+      </dl>
+
+      {/* Input Data */}
+      {hasInput && (
+        <div className="mb-6 rounded-xl border border-hair bg-card p-4">
+          <details>
+            <summary className="cursor-pointer font-semibold text-sm text-ink select-none list-none flex items-center gap-2 group">
+              <span className="group-open:rotate-90 transition-transform inline-block text-mut" aria-hidden="true">▶</span>
+              View Input Data
+            </summary>
+            <div className="mt-3 space-y-3">
+              <div>
+                <p className="k mb-1">Hex</p>
+                <pre className="max-h-48 overflow-auto whitespace-pre-wrap break-all rounded-lg border border-hair bg-canvas p-3 font-mono text-xs text-ink2">
+                  {effectiveInput}
+                </pre>
+                {inputTruncated && <p className="mt-1.5 text-xs text-warn">{TRUNCATED_INPUT_NOTE}</p>}
+              </div>
+              {decodedUtf8 && (
+                <div>
+                  <p className="k mb-1">UTF-8 Decoded</p>
+                  <pre className="max-h-48 overflow-auto whitespace-pre-wrap break-all rounded-lg border border-hair bg-canvas p-3 font-mono text-xs text-ink2">
+                    {decodedUtf8}
+                  </pre>
+                </div>
+              )}
+            </div>
+          </details>
+        </div>
+      )}
+
+      {shownInternalTxs.length > 0 && (
+        <div className="mb-6 rounded-xl border border-hair bg-card p-4">
+          <h2 className="mb-3 font-semibold tracking-[-0.02em] text-ink">Internal Transactions ({shownInternalTxs.length}{internalTxsTruncated ? '+' : ''})</h2>
+          <div className="space-y-2">
+            {shownInternalTxs.map((it) => (
+              <div key={it.traceAddress} className="flex flex-wrap items-center gap-2 text-sm">
+                <Badge variant="default">{it.callType}</Badge>
+                <span className="text-mut">From</span>
+                <AddressLink address={it.fromAddress} className="text-xs" />
+                <span className="text-mut">To</span>
+                {it.toAddress
+                  ? <AddressLink address={it.toAddress} className="text-xs" />
+                  : <span className="text-xs text-mut">(contract creation)</span>}
+                <span className="text-mut">For</span>
+                <span className="font-mono text-[13px] text-ink">{formatNativeToken(safeBigInt(it.value))} {chainConfig.currency}</span>
+              </div>
+            ))}
+          </div>
+          <p className="mt-3 text-xs text-mut">
+            Value-moving calls, contract creations and self-destructs decoded from execution traces. Zero-value calls are not listed.
+          </p>
+          {internalTxsTruncated && (
+            <p className="mt-2 text-xs text-mut">
+              Showing the first {TX_INTERNALS_SHOWN} internal transactions, in execution order — this transaction has more.{' '}
+              <a
+                href={`${chainConfig.externalExplorerUrl}/tx/${hash}`}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="text-acc-ink underline"
+              >
+                View all on {chainConfig.externalExplorer} ↗
+              </a>
+            </p>
+          )}
+        </div>
+      )}
+
+      {nftTransfers.length > 0 && (
+        <div className="mb-6 rounded-xl border border-hair bg-card p-4">
+          <h2 className="mb-3 font-semibold tracking-[-0.02em] text-ink">NFT Transfers ({nftTransfers.length})</h2>
+          <div className="space-y-2">
+            {nftTransfers.map((n, i) => (
+              <div key={i} className="flex flex-wrap items-center gap-2 text-sm">
+                <span className="text-mut">From</span>
+                <AddressLink address={n.fromAddress} className="text-xs" />
+                <span className="text-mut">To</span>
+                <AddressLink address={n.toAddress} className="text-xs" />
+                <span className="text-mut">For</span>
+                <span className="font-mono text-[13px] text-ink">
+                  <Link href={`/token/${n.tokenAddress}`} prefetch={false} className="text-acc-ink hover:underline">
+                    {getAddressLabel(n.tokenAddress) ?? shortenAddress(n.tokenAddress)}
+                  </Link>
+                  <span className="ml-1 text-mut">#{n.tokenId}</span>
+                </span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {!transfersAllShown && (
+        <div id="token-transfers" className="mb-6 scroll-mt-28 rounded-xl border border-hair bg-card p-4">
+          <h2 className="mb-3 font-semibold tracking-[-0.02em] text-ink">Token Transfers ({transferInfos.length}{transfersTruncated ? '+' : ''})</h2>
+          <div className="space-y-2">
+            {transferInfos.map((t, i) => <TransferRow key={i} t={t} />)}
+          </div>
+          {transfersTruncated && (
+            <p className="mt-3 text-xs text-mut">
+              Showing the first {TX_TRANSFERS_SHOWN} token transfers — this transaction has more.{' '}
+              <a
+                href={`${chainConfig.externalExplorerUrl}/tx/${hash}`}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="text-acc-ink underline"
+              >
+                View all on {chainConfig.externalExplorer} ↗
+              </a>
+            </p>
+          )}
+        </div>
+      )}
+
+      {txLogs.length > 0 && (
+        <div className="rounded-xl border border-hair bg-card p-4">
+          <h2 className="mb-3 font-semibold tracking-[-0.02em] text-ink">Event Logs ({txLogs.length})</h2>
+          <div className="space-y-3">
+            {txLogs.map((log, i) => {
+              const decoded = decodeEventName(log.topic0)
+              return (
+                <div key={i} className="overflow-auto rounded-lg border border-hair bg-canvas p-3 text-xs">
+                  <div className="flex items-center gap-2 mb-2">
+                    <span className="font-mono text-mut">#{i}</span>
+                    <AddressLink address={log.address} short={false} />
+                    {decoded && (
+                      <span className="rounded-[4px] bg-acc-t px-1.5 py-0.5 text-xs font-semibold text-acc-ink">
+                        {decoded.name}
+                      </span>
+                    )}
+                  </div>
+                  <div className="space-y-1 pl-6">
+                    {log.topic0 && (
+                      <div className="flex gap-2">
+                        <span className="w-14 shrink-0 text-mut">Topic0</span>
+                        <span className="font-mono text-ink2 break-all">{log.topic0}</span>
+                      </div>
+                    )}
+                    {log.topic1 && (
+                      <div className="flex gap-2">
+                        <span className="w-14 shrink-0 text-mut">Topic1</span>
+                        <span className="font-mono break-all">
+                          <span className="text-ink2">{log.topic1}</span>
+                          {decoded && decoded.params[0] && (
+                            <span className="ml-2 text-acc-ink">→ {decoded.params[0]}: {decodeTopicParam(log.topic1)}</span>
+                          )}
+                        </span>
+                      </div>
+                    )}
+                    {log.topic2 && (
+                      <div className="flex gap-2">
+                        <span className="w-14 shrink-0 text-mut">Topic2</span>
+                        <span className="font-mono break-all">
+                          <span className="text-ink2">{log.topic2}</span>
+                          {decoded && decoded.params[1] && (
+                            <span className="ml-2 text-acc-ink">→ {decoded.params[1]}: {decodeTopicParam(log.topic2)}</span>
+                          )}
+                        </span>
+                      </div>
+                    )}
+                    {log.data && log.data !== '0x' && (
+                      <div className="flex gap-2">
+                        <span className="w-14 shrink-0 text-mut">Data</span>
+                        <span className="font-mono text-ink2 break-all">
+                          {log.data.slice(0, 130)}{log.data.length > 130 ? '…' : ''}
+                        </span>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              )
+            })}
+          </div>
+        </div>
+      )}
+    </div>
+    </>
+  )
+}
+
+type TransferInfo = {
+  tokenAddress: string
+  fromAddress: string
+  toAddress: string
+  value: string
+  tokenSymbol?: string
+  tokenDecimals?: number
+  /** Decoded from calldata, not read from logs. */
+  unverified?: boolean
+}
+
+// One row of the token-transfer list; the summary preview and the full list render the same markup.
+function TransferRow({ t }: { t: TransferInfo }) {
+  const formattedAmount = t.tokenDecimals != null
+    ? formatTokenAmount(t.value, t.tokenDecimals, 6)
+    : null
+  const fullAmount = t.tokenDecimals != null
+    ? formatTokenAmount(t.value, t.tokenDecimals)
+    : t.value
+  return (
+    <div className="flex flex-wrap items-center gap-2 text-sm">
+      <span className="text-mut">From</span>
+      <AddressLink address={t.fromAddress} className="text-xs" />
+      <span className="text-mut">To</span>
+      <AddressLink address={t.toAddress} className="text-xs" />
+      <span className="text-mut">For</span>
+      <span className="font-mono text-[13px] text-ink">
+        <span title={fullAmount}>{formattedAmount ?? t.value}</span>
+        {' '}
+        <Link href={`/token/${t.tokenAddress}`} prefetch={false} className="text-acc-ink hover:underline">
+          {tokenTextOr(t.tokenSymbol, UNKNOWN_TOKEN)}
+        </Link>
+      </span>
+      {t.unverified && <span className="text-xs text-mut">({CALLDATA_TRANSFER_LABEL})</span>}
+    </div>
+  )
+}
+
+function Fact({
+  label,
+  sub,
+  children,
+}: {
+  label: string
+  sub?: string
+  children: React.ReactNode
+}) {
+  return (
+    <div>
+      <dt className="k">{label}</dt>
+      <dd className="mt-1 break-words font-mono text-[15px] text-ink">{children}</dd>
+      {sub && <dd className="mt-0.5 break-words text-xs text-mut">{sub}</dd>}
+    </div>
+  )
+}
+
+function RowShell({
+  label, mono = false, children,
+}: {
+  label: string
+  mono?: boolean
+  children: React.ReactNode
+}) {
+  return (
+    <div className="flex flex-col gap-1 px-4 py-3 sm:flex-row sm:gap-6 sm:px-6">
+      <dt className="text-[13px] text-mut sm:w-44 sm:shrink-0">{label}</dt>
+      <dd className={`min-w-0 break-all text-[13px] text-ink ${mono ? 'font-mono' : ''}`}>{children}</dd>
+    </div>
+  )
+}
+
+function Row({
+  label, value, mono = false, copy = false, link, addressLabel, copyReferralPlacement,
+}: {
+  label: string
+  value: string
+  mono?: boolean
+  copy?: boolean
+  link?: string
+  addressLabel?: string | null
+  copyReferralPlacement?: BinanceReferralPlacement
+}) {
+  return (
+    <RowShell label={label} mono={mono}>
+      {link ? (
+        <Link href={link} prefetch={false} className="text-acc-ink hover:underline">{value}</Link>
+      ) : (
+        value
+      )}
+      {copy && <CopyButton text={value} referralPlacement={copyReferralPlacement} />}
+      {addressLabel && (
+        <span className="ml-2 rounded-[4px] bg-acc-t px-1.5 py-0.5 text-xs text-acc-ink">
+          {addressLabel}
+        </span>
+      )}
+    </RowShell>
+  )
+}

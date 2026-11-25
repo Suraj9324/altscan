@@ -1,0 +1,248 @@
+import type { ChainConfig } from '@altscan/chain-config'
+import {
+  AD_PLACEMENTS,
+  type AdPlacement,
+  type AdsSettings,
+  type FooterSettings,
+  type HouseCreative,
+  type LinksSettings,
+  type RpcSettings,
+} from '@altscan/settings-schema'
+
+/** Mirrors the hardcoded footer links this feature replaces (Footer.tsx). */
+export const DEFAULT_QUICK_LINKS: LinksSettings['quickLinks'] = [
+  { label: 'Blocks', href: '/blocks' },
+  { label: 'Transactions', href: '/txs' },
+  { label: 'Tokens', href: '/token' },
+  { label: 'Charts', href: '/charts' },
+  { label: 'API', href: '/api-docs' },
+  { label: 'Developer', href: '/developer' },
+  { label: 'About', href: '/about' },
+  { label: 'Status', href: 'https://status.altscan.io' },
+  { label: 'Changelog', href: 'https://altscan.io/changelog' },
+  { label: 'GitHub', href: 'https://github.com/heathermhuang/altscan' },
+]
+
+export function resolveLinks(override: LinksSettings | null): LinksSettings['quickLinks'] {
+  return override?.quickLinks?.length ? override.quickLinks : DEFAULT_QUICK_LINKS
+}
+
+export function resolveFooterText(
+  override: FooterSettings | null,
+  chain: ChainConfig,
+): { tagline: string; notAffiliatedWith: string } {
+  return {
+    tagline: override?.tagline ?? chain.tagline,
+    notAffiliatedWith: override?.notAffiliatedWith ?? chain.notAffiliatedWith,
+  }
+}
+
+/**
+ * Precedence: console override → env → chain default. Keeping env as the middle
+ * tier means behaviour is byte-identical to the pre-override build whenever no
+ * override row exists. The override reaches here only after Zod validation
+ * (write-side AND read-side), so a malformed URL can never build a provider.
+ */
+/**
+ * Hosts of the resolved RPC endpoints, for display.
+ *
+ * HOST ONLY, deliberately: a keyed endpoint (Chainstack et al) carries its API
+ * key in the PATH, and the admin settings payload that renders this is readable
+ * by every console member including viewers. An unparseable entry degrades to
+ * 'unknown' rather than being echoed back.
+ */
+export function rpcHosts(urls: readonly string[]): string {
+  return urls
+    .map((u) => { try { return new URL(u).host } catch { return 'unknown' } })
+    .join(', ')
+}
+
+export function resolveRpc(
+  override: RpcSettings | null,
+  chain: ChainConfig,
+  env: NodeJS.ProcessEnv,
+): { urls: string[]; timeoutMs: number } {
+  const envTimeout = parseInt(env.RPC_TIMEOUT_MS ?? '8000', 10)
+  // Comma-separated, exactly like the indexer's RPC_URLS. This used to be read
+  // as ONE url, so pasting the indexer's list into a web service produced a
+  // single malformed endpoint and broke every RPC call on it. A list that
+  // trims to nothing falls back to the chain default rather than to zero
+  // endpoints, which would fail at call time instead of here.
+  const raw = override?.webRpcUrl ?? env[chain.rpcEnvVar] ?? chain.defaultRpcUrl
+  const urls = raw.split(',').map((s) => s.trim()).filter(Boolean)
+  return {
+    urls: urls.length > 0 ? urls : [chain.defaultRpcUrl],
+    timeoutMs: override?.rpcTimeoutMs ?? (Number.isFinite(envTimeout) && envTimeout > 0 ? envTimeout : 8000),
+  }
+}
+
+/** Same shape the settings schema accepts for `ads.binanceRefCode`. */
+const REF_CODE = /^[A-Za-z0-9_-]{2,32}$/
+
+/**
+ * The deployment's Binance referral code, from BINANCE_REF_CODE; null when unset
+ * or malformed. There is deliberately no built-in default: a fork that never sets
+ * one shows no referral placements, rather than earning for whoever wrote the code.
+ */
+export function envBinanceRefCode(env: NodeJS.ProcessEnv = process.env): string | null {
+  const code = env.BINANCE_REF_CODE?.trim()
+  return code && REF_CODE.test(code) ? code : null
+}
+
+/** refCode null ⇒ no Binance placements anywhere (house creatives are unaffected). */
+export function resolveAds(
+  override: AdsSettings | null,
+  env: NodeJS.ProcessEnv = process.env,
+): {
+  refCode: string | null
+  disabled: AdPlacement[]
+} {
+  const placements = override?.placements ?? {}
+  return {
+    refCode: override?.binanceRefCode ?? envBinanceRefCode(env),
+    disabled: AD_PLACEMENTS.filter((p) => placements[p]?.enabled === false),
+  }
+}
+
+export type BinanceCandidate = { kind: 'binance'; weight: number }
+export type HouseCandidate = {
+  kind: 'house'
+  weight: number
+  creativeId: string
+  headline: string
+  body?: string
+  ctaText: string
+  ctaUrl: string
+  imageUrl?: string
+  imageAlt?: string
+}
+export type ResolvedCandidate = BinanceCandidate | HouseCandidate
+
+export type AdConfigPayload = {
+  /** Whether Binance candidates may run: the visitor is not geo-restricted AND a
+   *  referral code is configured. Kept for pre-Phase-B clients holding a cached config shape. */
+  eligible: boolean
+  refCode: string | null
+  disabled: AdPlacement[]
+  /** Only placements with an explicit mix appear. Absent ⇒ Binance-only. */
+  placements: Partial<Record<AdPlacement, { candidates: ResolvedCandidate[] }>>
+}
+
+/** The bucket base must be a plain https ORIGIN — scheme + host, nothing else.
+ *  Anything else ⇒ render the creative text-only rather than emit a broken or
+ *  plaintext <img>.
+ *
+ *  This used to validate the parsed URL and then concatenate the ORIGINAL
+ *  string, so everything the parser was consulted about got discarded. Only the
+ *  protocol was actually enforced; the rest of the contract in this comment was
+ *  decorative. Concretely, `CREATIVES_BASE_URL=https://creatives.altscan.io#staging`
+ *  produced `https://creatives.altscan.io#staging/<key>` — the object key lands
+ *  inside the fragment, the browser requests `/`, and EVERY creative image on
+ *  the deployment breaks at once from one stray character in an env var. A
+ *  query string detaches the key the same way, and embedded credentials would
+ *  be published into every rendered <img src>. Build from base.origin so the
+ *  parse result is what actually ships. */
+function safeImageUrl(baseUrl: string, key: string): string | undefined {
+  try {
+    const base = new URL(baseUrl)
+    if (base.protocol !== 'https:') return undefined
+    if (base.username || base.password) return undefined
+    if (base.search || base.hash) return undefined
+    if (base.pathname !== '/') return undefined
+    return `${base.origin}/${key}`
+  } catch {
+    return undefined
+  }
+}
+
+function toHouseCandidate(
+  creative: HouseCreative,
+  weight: number,
+  creativesBaseUrl: string,
+  keyPrefix: string | null,
+): HouseCandidate {
+  // The shared schema proves the key is WELL-FORMED; only this deployment knows
+  // which tenant/explorer prefix is legitimately ITS OWN. Without this check the
+  // console's ownership fence is the only one, and a direct ADMIN_SECRET write,
+  // a migration, or a row copied between explorers would render another
+  // explorer's artwork here. Drop just the image, not the whole ad.
+  // Three cases, and the difference between the last two is the whole point:
+  //   null/undefined → not configured at all; no check (the route always passes
+  //                    a derived prefix, so this is library back-compat only).
+  //   ""             → configured but BLANK. A misconfiguration, and every key
+  //                    startsWith("") — so treating it as a prefix would allow
+  //                    everything. Fail CLOSED: serve no image at all.
+  //   "altscan/bnb"  → normalise the trailing slash, or it also matches the
+  //                    "altscan/bnb2/…" lookalike this check exists to stop.
+  const configured = keyPrefix?.trim()
+  const prefix =
+    keyPrefix == null ? null : configured ? (configured.endsWith('/') ? configured : `${configured}/`) : ''
+  const ownKey =
+    !creative.imageKey || prefix === null || (prefix !== '' && creative.imageKey.startsWith(prefix))
+  const imageUrl =
+    creative.imageKey && ownKey ? safeImageUrl(creativesBaseUrl, creative.imageKey) : undefined
+  return {
+    kind: 'house',
+    weight,
+    creativeId: creative.id,
+    ...(creative.body ? { body: creative.body } : {}),
+    headline: creative.headline,
+    ctaText: creative.ctaText,
+    ctaUrl: creative.ctaUrl,
+    ...(imageUrl ? { imageUrl } : {}),
+    ...(imageUrl && creative.imageAlt ? { imageAlt: creative.imageAlt } : {}),
+  }
+}
+
+/**
+ * The whole payload served by /api/ads/binance-eligibility.
+ *
+ * Geo handling (deliberate change): restriction drops BINANCE candidates only.
+ * House creatives are ours, not Binance's, so suppressing them on Binance's
+ * behalf would be wrong. A placement left with no candidates renders nothing —
+ * which is exactly what a binance-only placement did before this feature.
+ */
+export function buildAdConfig(
+  override: AdsSettings | null,
+  opts: {
+    binanceRestricted: boolean
+    creativesBaseUrl: string
+    /** Prefix this explorer owns, e.g. "altscan/bnb/". null ⇒ no ownership
+     *  check (back-compatible when CREATIVES_KEY_PREFIX is unset). */
+    creativesKeyPrefix?: string | null
+  },
+  env: NodeJS.ProcessEnv = process.env,
+): AdConfigPayload {
+  const { refCode, disabled } = resolveAds(override, env)
+  const binanceOn = !opts.binanceRestricted && refCode !== null
+  const byId = new Map((override?.creatives ?? []).map((c) => [c.id, c]))
+  const placements: AdConfigPayload['placements'] = {}
+
+  for (const [placement, cfg] of Object.entries(override?.placements ?? {})) {
+    if (!cfg?.mix) continue
+    const candidates: ResolvedCandidate[] = []
+    for (const slot of cfg.mix) {
+      if (slot.provider === 'binance') {
+        if (binanceOn) candidates.push({ kind: 'binance', weight: slot.weight })
+        continue
+      }
+      const creative = slot.creativeId ? byId.get(slot.creativeId) : undefined
+      // Defensive: Zod already rejects a dangling reference on write and on
+      // read. If one ever gets through, drop the slot — never render a
+      // headline-less ad.
+      if (creative) {
+        candidates.push(
+          toHouseCandidate(
+            creative,
+            slot.weight,
+            opts.creativesBaseUrl,
+            opts.creativesKeyPrefix ?? null,
+          ),
+        )
+      }
+    }
+    placements[placement as AdPlacement] = { candidates }
+  }
+
+  return { eligible: binanceOn, refCode, disabled, placements }
+}

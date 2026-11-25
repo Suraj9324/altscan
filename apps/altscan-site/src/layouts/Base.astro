@@ -1,0 +1,84 @@
+---
+import '@fontsource-variable/inter/wght.css';
+import '@fontsource/jetbrains-mono/latin-400.css';
+import '@fontsource/jetbrains-mono/latin-500.css';
+import '@fontsource/jetbrains-mono/latin-600.css';
+import interLatin from '@fontsource-variable/inter/files/inter-latin-wght-normal.woff2?url';
+import '../styles/global.css';
+import { GITHUB } from '../data/site';
+
+interface Props { title?: string; description?: string; }
+const {
+  title = 'Altscan — the open-source, multi-chain block explorer platform',
+  description = 'One open-source engine powering independent block explorers across chains. BNBScan and EthScan are live today, more on the way.',
+} = Astro.props;
+const canonical = new URL(Astro.url.pathname, Astro.site).href;
+
+// Organization + WebSite + SoftwareSourceCode — the GitHub repo is the citable
+// artifact for the open-source positioning (answer engines resolve "what is
+// Altscan" through these entities).
+const jsonLd = {
+  '@context': 'https://schema.org',
+  '@graph': [
+    {
+      '@type': 'Organization',
+      '@id': 'https://altscan.io/#org',
+      name: 'Altscan',
+      url: 'https://altscan.io',
+      sameAs: [GITHUB, 'https://bnbscan.com', 'https://ethscan.io'],
+    },
+    {
+      '@type': 'WebSite',
+      '@id': 'https://altscan.io/#website',
+      url: 'https://altscan.io',
+      name: 'Altscan',
+      description,
+      publisher: { '@id': 'https://altscan.io/#org' },
+    },
+    {
+      '@type': 'SoftwareSourceCode',
+      name: 'Altscan',
+      codeRepository: GITHUB,
+      programmingLanguage: 'TypeScript',
+      runtimePlatform: 'Node.js',
+      license: 'https://www.gnu.org/licenses/agpl-3.0.html',
+      about: 'Open-source multi-chain block explorer platform powering bnbscan.com and ethscan.io',
+      url: 'https://altscan.io',
+    },
+  ],
+};
+---
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{title}</title>
+    <meta name="description" content={description} />
+    <link rel="canonical" href={canonical} />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <link rel="preload" href={interLatin} as="font" type="font/woff2" crossorigin />
+    <meta name="color-scheme" content="light dark" />
+    <meta name="theme-color" media="(prefers-color-scheme: light)" content="#fbfbfc" />
+    <meta name="theme-color" media="(prefers-color-scheme: dark)" content="#0b0b0f" />
+    <meta property="og:type" content="website" />
+    <meta property="og:title" content={title} />
+    <meta property="og:description" content={description} />
+    <meta property="og:url" content={canonical} />
+    <meta property="og:image" content="https://altscan.io/og.png" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <script type="application/ld+json" set:html={JSON.stringify(jsonLd)} />
+    {/* Cloudflare Web Analytics — privacy-first, no cookies/consent banner.
+        Public beacon token (safe to commit). is:inline keeps Astro from
+        bundling/transforming the third-party beacon (preserves data-cf-beacon). */}
+    <script
+      is:inline
+      defer
+      src="https://static.cloudflareinsights.com/beacon.min.js"
+      data-cf-beacon='{"token": "f19b095fbf3a4b6eac6eb0cc10f3cdc3"}'
+    ></script>
+  </head>
+  <body>
+    <slot />
+  </body>
+</html>

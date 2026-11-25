@@ -1,0 +1,64 @@
+# syntax=docker/dockerfile:1
+#
+# Altscan indexer — one image serves any chain; CHAIN selects at runtime.
+#
+#   docker build -f docker/Dockerfile.indexer -t altscan-indexer .
+#
+# The indexer creates its own schema on boot (apps/indexer/src/ensure-schema.ts),
+# so there is no separate migration step for a fresh database.
+
+FROM node:22-alpine AS base
+RUN corepack enable
+WORKDIR /app
+
+# ── Build ────────────────────────────────────────────────────────────────────
+FROM base AS build
+
+# node-gyp toolchain for any dependency without a prebuilt musl binary
+RUN apk add --no-cache python3 make g++ libc6-compat
+
+COPY . .
+RUN pnpm install --frozen-lockfile
+
+# Every workspace package the indexer require()s at runtime emits dist/, and dist/
+# is gitignored, so each must be built here or the module is absent in the image.
+# explorer-core and providers load lazily (only when BACKFILL_ENABLED=true), so
+# omitting them fails at BOOT the first time backfill is enabled, not at build —
+# exactly how the production indexers died on 2026-08-07 with "Cannot find module
+# .../@altscan/providers/dist/index.js".
+# Order matters: chain-config first (providers type-imports it), then explorer-core
+# (providers value-imports it), then providers, then db, then the indexer.
+RUN pnpm --filter @altscan/chain-config build \
+ && pnpm --filter @altscan/explorer-core build \
+ && pnpm --filter @altscan/providers build \
+ && pnpm --filter @altscan/db build \
+ && pnpm --filter @altscan/indexer build
+
+# Assert the artifact and that every runtime require() actually resolves — the
+# 2026-08-07 failure verified at build time instead of at boot.
+RUN test -s apps/indexer/dist/index.js \
+ && node --check apps/indexer/dist/index.js \
+ && test -s packages/chain-config/dist/index.js \
+ && test -s packages/explorer-core/dist/index.js \
+ && test -s packages/providers/dist/index.js \
+ && cd apps/indexer \
+ && node -e "const p=require.resolve('@altscan/chain-config'); if(!p.endsWith('.js')) throw new Error('[build-check] chain-config resolves to '+p+', expected compiled .js'); require('@altscan/chain-config'); require('@altscan/providers'); console.log('[build-check] chain-config -> '+p+' loads; @altscan/providers loads (transitively proves explorer-core)')"
+
+# ── Runtime ──────────────────────────────────────────────────────────────────
+FROM base AS runtime
+ENV NODE_ENV=production
+
+RUN apk add --no-cache libc6-compat \
+ && addgroup -S altscan && adduser -S altscan -G altscan
+
+COPY --from=build --chown=altscan:altscan /app /app
+COPY --chown=altscan:altscan docker/indexer-entrypoint.sh /usr/local/bin/altscan-entrypoint
+RUN chmod +x /usr/local/bin/altscan-entrypoint
+
+USER altscan
+WORKDIR /app/apps/indexer
+
+# CHAIN, the chain's DB env var, REDIS_URL and the RPC URL are supplied at run time.
+# The entrypoint resolves START_BLOCK=tip to a live block number before starting.
+ENTRYPOINT ["/usr/local/bin/altscan-entrypoint"]
+CMD ["node", "dist/index.js"]
